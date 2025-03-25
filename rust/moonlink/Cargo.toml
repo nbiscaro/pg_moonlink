@@ -3,8 +3,23 @@ name = "moonlink"
 version.workspace = true
 edition.workspace = true
 
+[features]
+default = ["unknown_types_to_bytes"]
+unknown_types_to_bytes = []
+
 [dependencies]
+serde_json = { workspace = true, features = ["std"] }
+uuid = { workspace = true, features = ["v4", "std"] }
+bytes = { workspace = true }
+chrono = { workspace = true, features = ["serde", "std"] }
+postgres-replication = { workspace = true }
+pg_escape = { workspace = true }
 async-trait.workspace = true
-pg_replicate.workspace = true
-tokio.workspace = true
+futures = { workspace = true }
+pin-project-lite = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros"] }
 tokio-postgres.workspace = true
+tracing = "0.1"
+bigdecimal = "0.4"
+byteorder = "1.4"
