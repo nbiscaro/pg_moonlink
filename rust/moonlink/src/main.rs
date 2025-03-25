@@ -1,12 +1,11 @@
-mod sink;
 mod replication;
 
 use replication::pipeline::{
     batching::{data_pipeline::BatchDataPipeline, BatchConfig},
     sources::postgres::{PostgresSource, TableNamesFrom},
+    sinks::sink::Sink,
     PipelineAction,
 };
-use sink::Sink;
 use std::{error::Error, time::Duration};
 
 async fn main_impl() -> Result<(), Box<dyn Error>> {

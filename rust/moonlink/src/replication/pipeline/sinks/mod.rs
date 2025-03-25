@@ -9,6 +9,8 @@ use crate::replication::{
     table::{TableId, TableSchema},
 };
 
+pub mod sink;
+
 use super::PipelineResumptionState;
 
 pub trait SinkError: std::error::Error + Send + Sync + 'static {}
