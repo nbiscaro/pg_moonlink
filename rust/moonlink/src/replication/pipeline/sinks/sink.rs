@@ -1,4 +1,3 @@
-use async_trait::async_trait;
 use crate::replication::{
     conversions::{cdc_event::CdcEvent, table_row::TableRow},
     pipeline::{
@@ -7,6 +6,7 @@ use crate::replication::{
     },
     table::{TableId, TableSchema},
 };
+use async_trait::async_trait;
 use std::collections::{HashMap, HashSet};
 use tokio_postgres::types::PgLsn;
 

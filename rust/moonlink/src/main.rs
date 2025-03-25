@@ -2,8 +2,8 @@ mod replication;
 
 use replication::pipeline::{
     batching::{data_pipeline::BatchDataPipeline, BatchConfig},
-    sources::postgres::{PostgresSource, TableNamesFrom},
     sinks::sink::Sink,
+    sources::postgres::{PostgresSource, TableNamesFrom},
     PipelineAction,
 };
 use std::{error::Error, time::Duration};

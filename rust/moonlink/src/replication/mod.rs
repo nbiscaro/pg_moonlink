@@ -2,6 +2,6 @@
 #![allow(dead_code)]
 
 pub mod clients;
-pub mod pipeline;
 pub mod conversions;
+pub mod pipeline;
 pub mod table;

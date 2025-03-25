@@ -93,7 +93,8 @@ impl CdcEventConverter {
             .old_tuple()
             .map(|tuple| Self::try_from_tuple_data_slice(column_schemas, tuple.tuple_data()))
             .transpose()?;
-        let new_row = Self::try_from_tuple_data_slice(column_schemas, update_body.new_tuple().tuple_data())?;
+        let new_row =
+            Self::try_from_tuple_data_slice(column_schemas, update_body.new_tuple().tuple_data())?;
 
         Ok(CdcEvent::Update((table_id, old_row, new_row)))
     }

@@ -5,7 +5,9 @@ use thiserror::Error;
 use tokio_postgres::types::Type;
 use tracing::error;
 
-use crate::replication::{conversions::text::TextFormatConverter, pipeline::batching::BatchBoundary};
+use crate::replication::{
+    conversions::text::TextFormatConverter, pipeline::batching::BatchBoundary,
+};
 
 use super::{text::FromTextError, Cell};
 
