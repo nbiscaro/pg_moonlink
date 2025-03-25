@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use pg_replicate::{
+use crate::replication::{
     conversions::{cdc_event::CdcEvent, table_row::TableRow},
     pipeline::{
         sinks::{BatchSink, InfallibleSinkError},

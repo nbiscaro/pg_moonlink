@@ -1,6 +1,7 @@
 mod sink;
+mod replication;
 
-use pg_replicate::pipeline::{
+use replication::pipeline::{
     batching::{data_pipeline::BatchDataPipeline, BatchConfig},
     sources::postgres::{PostgresSource, TableNamesFrom},
     PipelineAction,
