@@ -289,7 +289,7 @@ impl MooncakeTable {
         Ok(())
     }
 
-    pub fn delete_in_stream_batch(&mut self, row: MoonlinkRow, xact_id: u32) -> Result<()> {
+    pub fn delete_in_stream_batch(&mut self, row: MoonlinkRow, xact_id: u32) {
         let lookup_key = (self.metadata.get_lookup_key)(&row);
         let mut record = RawDeletionRecord {
             lookup_key,
@@ -304,20 +304,11 @@ impl MooncakeTable {
         // This is fine since we will flush and remap to disk position on commit
         record.pos = pos;
         stream_state.new_deletions.push(record);
-
-        Ok(())
     }
 
-    pub fn commit_in_stream_batch(&mut self, _xact_id: u32, _lsn: u64) -> Result<()> {
-        // handled in the immediate flush
-        Ok(())
-    }
-
-    pub fn abort_in_stream_batch(&mut self, xact_id: u32) -> Result<()> {
+    pub fn abort_in_stream_batch(&mut self, xact_id: u32) {
         // Simply remove the transaction stream state
         self.transaction_stream_states.remove(&xact_id);
-
-        Ok(())
     }
 
     fn inner_flush(
@@ -1332,7 +1323,7 @@ mod tests {
             RowValue::ByteArray("Tx1-Row2".as_bytes().to_vec()),
             RowValue::Int32(32),
         ]);
-        table.delete_in_stream_batch(row_to_delete, xact_id_1)?;
+        table.delete_in_stream_batch(row_to_delete, xact_id_1);
 
         // Delete a row from Transaction 3
         let row_to_delete = MoonlinkRow::new(vec![
@@ -1340,13 +1331,10 @@ mod tests {
             RowValue::ByteArray("Tx3-Row1".as_bytes().to_vec()),
             RowValue::Int32(35),
         ]);
-        table.delete_in_stream_batch(row_to_delete, xact_id_3)?;
+        table.delete_in_stream_batch(row_to_delete, xact_id_3);
 
         // Phase 4: Commit Transaction 1
         println!("Phase 4: Committing Transaction 1");
-        // Call commit_in_stream_batch (now a no-op)
-        table.commit_in_stream_batch(xact_id_1, 1)?;
-
         // Flush the transaction data to disk
         println!("Flushing Transaction 1 data...");
         let flush_handle = table.flush_transaction_stream(xact_id_1, 1)?;
@@ -1399,7 +1387,7 @@ mod tests {
 
         // Phase 5: Abort Transaction 2
         println!("Phase 5: Aborting Transaction 2");
-        table.abort_in_stream_batch(xact_id_2)?;
+        table.abort_in_stream_batch(xact_id_2);
 
         // Check that Transaction 2's stream was removed
         assert_eq!(
@@ -1420,9 +1408,6 @@ mod tests {
             RowValue::Int32(37),
         ]);
         table.append_in_stream_batch(additional_row, xact_id_3)?;
-
-        // Commit Transaction 3
-        table.commit_in_stream_batch(xact_id_3, 2)?;
 
         // Flush the transaction data to disk
         println!("Flushing Transaction 3 data...");
@@ -1554,16 +1539,13 @@ mod tests {
             RowValue::ByteArray("Row 2".as_bytes().to_vec()),
             RowValue::Int32(22),
         ]);
-        table.delete_in_stream_batch(row_to_delete, xact_id)?;
+        table.delete_in_stream_batch(row_to_delete, xact_id);
 
         // Verify transaction state exists before flush
         assert!(
             table.transaction_stream_states.contains_key(&xact_id),
             "Expected transaction state to exist before flush"
         );
-
-        // Call commit_in_stream_batch (which is now a no-op)
-        table.commit_in_stream_batch(xact_id, 1)?;
 
         // Flush the transaction
         println!("Flushing transaction...");
