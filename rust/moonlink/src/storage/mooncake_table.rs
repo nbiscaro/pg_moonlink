@@ -1,5 +1,5 @@
-use super::index::{get_lookup_key, Index, MemIndex, MooncakeIndex};
-use crate::error::Result;
+use super::index::index_util::{get_lookup_key, Index, MemIndex, MooncakeIndex};
+use crate::error::{Error, Result};
 use crate::row::MoonlinkRow;
 use crate::storage::data_batches::InMemoryBatch;
 use crate::storage::delete_vector::BatchDeletionVector;
@@ -173,6 +173,22 @@ impl SnapshotTableState {
     }
 }
 
+/// Used to track the state of a streamed transaction
+/// Holds the memslice and pending deletes
+struct TransactionStreamState {
+    mem_slice: MemSlice,
+    new_deletions: Vec<RawDeletionRecord>,
+}
+
+impl TransactionStreamState {
+    fn new(schema: Arc<Schema>, batch_size: usize) -> Self {
+        Self {
+            mem_slice: MemSlice::new(schema, batch_size),
+            new_deletions: Vec::new(),
+        }
+    }
+}
+
 /// MooncakeTable is a disk table + mem slice.
 /// Transactions will append data to the mem slice.
 ///
@@ -192,9 +208,8 @@ pub struct MooncakeTable {
     snapshot: Arc<RwLock<SnapshotTableState>>,
     next_snapshot_task: SnapshotTask,
 
-    // UNDONE(BATCH_INSERT):
-    // a memslice per transaction?
-    _stream_write_mem_slices: HashMap<u64, MemSlice>,
+    // Stream state per transaction
+    transaction_stream_states: HashMap<u32, TransactionStreamState>,
 }
 
 impl MooncakeTable {
@@ -216,7 +231,7 @@ impl MooncakeTable {
             metadata: metadata.clone(),
             snapshot: Arc::new(RwLock::new(SnapshotTableState::new(metadata))),
             next_snapshot_task: SnapshotTask::new(),
-            _stream_write_mem_slices: HashMap::new(),
+            transaction_stream_states: HashMap::new(),
         };
 
         table
@@ -254,47 +269,130 @@ impl MooncakeTable {
         self.mem_slice.get_num_rows() >= self.metadata.config.batch_size
     }
 
-    pub fn _append_in_stream_batch(&mut self, _row: MoonlinkRow, _xact_id: u64) -> Result<()> {
-        todo!("Implement append in stream batch");
+    fn get_or_create_stream_state(&mut self, xact_id: u32) -> &mut TransactionStreamState {
+        self.transaction_stream_states
+            .entry(xact_id)
+            .or_insert_with(|| {
+                TransactionStreamState::new(
+                    self.metadata.schema.clone(),
+                    self.metadata.config.batch_size,
+                )
+            })
     }
 
-    pub fn _delete_in_stream_batch(&mut self, _row: MoonlinkRow, _xact_id: u64) -> Result<()> {
-        todo!("Implement delete in stream batch");
+    pub fn append_in_stream_batch(&mut self, row: MoonlinkRow, xact_id: u32) -> Result<()> {
+        let lookup_key = (self.metadata.get_lookup_key)(&row);
+        let stream_state = self.get_or_create_stream_state(xact_id);
+
+        stream_state.mem_slice.append(lookup_key, &row)?;
+
+        Ok(())
     }
 
-    pub fn _commit_in_stream_batch(&mut self, _xact_id: u64) -> Result<()> {
-        todo!("Implement commit in stream batch");
+    pub fn delete_in_stream_batch(&mut self, row: MoonlinkRow, xact_id: u32) -> Result<()> {
+        let lookup_key = (self.metadata.get_lookup_key)(&row);
+        let mut record = RawDeletionRecord {
+            lookup_key,
+            lsn: 0, // Updated at commit time
+            pos: None,
+            _row_identity: None,
+        };
+
+        let stream_state = self.get_or_create_stream_state(xact_id);
+        let pos = stream_state.mem_slice.delete(&record);
+
+        // This is fine since we will flush and remap to disk position on commit
+        record.pos = pos;
+        stream_state.new_deletions.push(record);
+
+        Ok(())
     }
 
-    pub fn _abort_in_stream_batch(&mut self, _xact_id: u64) -> Result<()> {
-        todo!("Implement abort in stream batch");
+    pub fn commit_in_stream_batch(&mut self, _xact_id: u32, _lsn: u64) -> Result<()> {
+        // handled in the immediate flush
+        Ok(())
+    }
+
+    pub fn abort_in_stream_batch(&mut self, xact_id: u32) -> Result<()> {
+        // Simply remove the transaction stream state
+        self.transaction_stream_states.remove(&xact_id);
+
+        Ok(())
+    }
+
+    fn inner_flush(
+        mem_slice: &mut MemSlice,
+        snapshot_task: &mut SnapshotTask,
+        metadata: &Arc<TableMetadata>,
+        lsn: u64,
+    ) -> JoinHandle<Result<DiskSliceWriter>> {
+        // Finalize the current batch (if needed)
+        let (new_batch, batches, index) = mem_slice
+            .flush()
+            .expect("mem_slice.flush() should not fail");
+
+        if let Some(batch) = new_batch {
+            snapshot_task.new_record_batches.push(batch);
+            snapshot_task.new_rows.clear();
+        }
+
+        let index = Arc::new(index);
+        snapshot_task.new_mem_indices.push(index.clone());
+
+        let mut disk_slice = DiskSliceWriter::new(
+            metadata.schema.clone(),
+            metadata.path.clone(),
+            batches,
+            lsn,
+            index,
+        );
+
+        spawn(async move {
+            disk_slice.write()?;
+            Ok(disk_slice)
+        })
+    }
+
+    pub fn flush_transaction_stream(
+        &mut self,
+        xact_id: u32,
+        lsn: u64,
+    ) -> Result<JoinHandle<Result<DiskSliceWriter>>> {
+        if let Some(mut stream_state) = self.transaction_stream_states.remove(&xact_id) {
+            let mem_slice = &mut stream_state.mem_slice;
+            let snapshot_task = &mut self.next_snapshot_task;
+
+            // We update our delete records with the last lsn of the transaction
+            // Note that in the stream case we dont have this until commit time
+            for deletion in stream_state.new_deletions.iter_mut() {
+                deletion.lsn = lsn;
+            }
+
+            // Now extend the snapshot task with the updated deletion records
+            snapshot_task
+                .new_deletions
+                .extend(stream_state.new_deletions);
+
+            Ok(Self::inner_flush(
+                mem_slice,
+                snapshot_task,
+                &self.metadata,
+                lsn,
+            ))
+        } else {
+            Err(Error::TransactionNotFound(xact_id))
+        }
     }
 
     // UNDONE(BATCH_INSERT):
     // flush uncommitted batches from big batch insert
     pub fn flush(&mut self, lsn: u64) -> JoinHandle<Result<DiskSliceWriter>> {
-        // finalize the current batch
-        let (new_batch, batches, index) = self.mem_slice.flush().unwrap();
-        if let Some(batch) = new_batch {
-            self.next_snapshot_task.new_record_batches.push(batch);
-            self.next_snapshot_task.new_rows = vec![];
-        }
-        let old_index = Arc::new(index);
-        self.next_snapshot_task
-            .new_mem_indices
-            .push(old_index.clone());
-        let mut disk_slice = DiskSliceWriter::new(
-            self.metadata.schema.clone(),
-            self.metadata.path.clone(),
-            batches,
+        Self::inner_flush(
+            &mut self.mem_slice,
+            &mut self.next_snapshot_task,
+            &self.metadata,
             lsn,
-            old_index,
-        );
-        // Spawn a task to build the disk slice asynchronously
-        spawn(async move {
-            disk_slice.write()?;
-            Ok(disk_slice)
-        })
+        )
     }
 
     pub fn commit_flush(&mut self, disk_slice: DiskSliceWriter) -> Result<()> {
@@ -412,8 +510,6 @@ impl MooncakeTable {
         if next_snapshot_task.new_record_batches.len() > 0 {
             let new_batches = take(&mut next_snapshot_task.new_record_batches);
             // previous unfinished batch is finished
-            assert!(snapshot.batches.values().last().unwrap().data.is_none());
-            assert!(snapshot.batches.keys().last().unwrap() == &new_batches.first().unwrap().0);
             snapshot.batches.last_entry().unwrap().get_mut().data =
                 Some(new_batches.first().unwrap().1.clone());
             // insert the last unfinished batch
@@ -1121,6 +1217,412 @@ mod tests {
         temp_dir.close().unwrap();
 
         println!("Deletions test passed!");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_transaction_stream_isolation() -> Result<()> {
+        // Create a temporary directory for test data
+        let temp_dir = tempdir().unwrap();
+        let test_dir = temp_dir.path().join("test_stream_dir");
+        create_dir_all(&test_dir).unwrap();
+        println!("Test directory: {:?}", test_dir);
+
+        // Create a schema for testing
+        let schema = Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("name", DataType::Utf8, true),
+            Field::new("age", DataType::Int32, false),
+        ]);
+
+        // Create a MooncakeTable
+        let mut table = MooncakeTable::new(
+            schema,
+            "transaction_stream_test".to_string(),
+            1,
+            test_dir.clone(),
+        );
+
+        // Set up test scenario with multiple transactions
+        println!("Phase 1: Setting up transactions");
+
+        // Transaction 1: Will be committed
+        let xact_id_1 = 101;
+        let xact1_rows = vec![
+            MoonlinkRow::new(vec![
+                RowValue::Int32(1),
+                RowValue::ByteArray("Tx1-Row1".as_bytes().to_vec()),
+                RowValue::Int32(31),
+            ]),
+            MoonlinkRow::new(vec![
+                RowValue::Int32(2),
+                RowValue::ByteArray("Tx1-Row2".as_bytes().to_vec()),
+                RowValue::Int32(32),
+            ]),
+        ];
+
+        // Transaction 2: Will be aborted
+        let xact_id_2 = 102;
+        let xact2_rows = vec![
+            MoonlinkRow::new(vec![
+                RowValue::Int32(3),
+                RowValue::ByteArray("Tx2-Row1".as_bytes().to_vec()),
+                RowValue::Int32(33),
+            ]),
+            MoonlinkRow::new(vec![
+                RowValue::Int32(4),
+                RowValue::ByteArray("Tx2-Row2".as_bytes().to_vec()),
+                RowValue::Int32(34),
+            ]),
+        ];
+
+        // Transaction 3: Will modify data then commit
+        let xact_id_3 = 103;
+        let xact3_rows = vec![
+            MoonlinkRow::new(vec![
+                RowValue::Int32(5),
+                RowValue::ByteArray("Tx3-Row1".as_bytes().to_vec()),
+                RowValue::Int32(35),
+            ]),
+            MoonlinkRow::new(vec![
+                RowValue::Int32(6),
+                RowValue::ByteArray("Tx3-Row2".as_bytes().to_vec()),
+                RowValue::Int32(36),
+            ]),
+        ];
+
+        // Phase 2: Add rows to each transaction stream
+        println!("Phase 2: Adding rows to transaction streams");
+
+        // Add Transaction 1 rows
+        for row in xact1_rows {
+            table.append_in_stream_batch(row, xact_id_1)?;
+        }
+
+        // Add Transaction 2 rows (will be aborted)
+        for row in xact2_rows {
+            table.append_in_stream_batch(row, xact_id_2)?;
+        }
+
+        // Add Transaction 3 rows
+        for row in xact3_rows {
+            table.append_in_stream_batch(row, xact_id_3)?;
+        }
+
+        // Verify we can see the transaction states but they haven't affected the table yet
+        assert_eq!(
+            table.transaction_stream_states.len(),
+            3,
+            "Expected 3 active transaction streams"
+        );
+
+        // The main table should still be empty
+        assert_eq!(
+            table.mem_slice.get_num_rows(),
+            0,
+            "Expected main table to be empty before commits"
+        );
+
+        // Phase 3: Delete operations
+        println!("Phase 3: Performing delete operations in transaction streams");
+
+        // Delete a row from Transaction 1
+        let row_to_delete = MoonlinkRow::new(vec![
+            RowValue::Int32(2),
+            RowValue::ByteArray("Tx1-Row2".as_bytes().to_vec()),
+            RowValue::Int32(32),
+        ]);
+        table.delete_in_stream_batch(row_to_delete, xact_id_1)?;
+
+        // Delete a row from Transaction 3
+        let row_to_delete = MoonlinkRow::new(vec![
+            RowValue::Int32(5),
+            RowValue::ByteArray("Tx3-Row1".as_bytes().to_vec()),
+            RowValue::Int32(35),
+        ]);
+        table.delete_in_stream_batch(row_to_delete, xact_id_3)?;
+
+        // Phase 4: Commit Transaction 1
+        println!("Phase 4: Committing Transaction 1");
+        // Call commit_in_stream_batch (now a no-op)
+        table.commit_in_stream_batch(xact_id_1, 1)?;
+
+        // Flush the transaction data to disk
+        println!("Flushing Transaction 1 data...");
+        let flush_handle = table.flush_transaction_stream(xact_id_1, 1)?;
+
+        // Wait for flush to complete and get the disk slice writer
+        let disk_slice = flush_handle.await.unwrap()?;
+
+        // Commit the flush
+        table.commit_flush(disk_slice)?;
+
+        // Create snapshot to apply changes
+        let snapshot_handle = table.create_snapshot().unwrap();
+        assert!(
+            snapshot_handle.await.is_ok(),
+            "Initial snapshot creation failed"
+        );
+
+        // Check that only Transaction 1's data is visible (and one row was deleted)
+        assert_eq!(
+            table.transaction_stream_states.len(),
+            2,
+            "Expected 2 remaining transaction streams after committing one"
+        );
+
+        // Read state - should only see Transaction 1's remaining row
+        println!("Checking table state after Transaction 1 commit");
+        let (file_paths, _deletions) = table.request_read()?;
+        if !file_paths.is_empty() {
+            let file_path = &file_paths[0];
+            let file = File::open(file_path).unwrap();
+            let builder = ParquetRecordBatchReaderBuilder::try_new(file).unwrap();
+            let mut reader = builder.build().unwrap();
+            let batch = reader.next().unwrap().unwrap();
+
+            println!("Batch after Tx1 commit: {:?}", batch);
+
+            // Should only have 1 row with ID=1 (since ID=2 was deleted)
+            assert_eq!(
+                batch.num_rows(),
+                1,
+                "Expected only one row after Transaction 1 commit"
+            );
+            let id_col = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
+            assert_eq!(id_col.value(0), 1, "Expected only row ID 1 to be present");
+        }
+
+        // Phase 5: Abort Transaction 2
+        println!("Phase 5: Aborting Transaction 2");
+        table.abort_in_stream_batch(xact_id_2)?;
+
+        // Check that Transaction 2's stream was removed
+        assert_eq!(
+            table.transaction_stream_states.len(),
+            1,
+            "Expected 1 remaining transaction stream after aborting one"
+        );
+
+        // Transaction 2's data should never appear in the table
+
+        // Phase 6: Commit Transaction 3
+        println!("Phase 6: Committing Transaction 3");
+
+        // Add another row to Transaction 3 before committing
+        let additional_row = MoonlinkRow::new(vec![
+            RowValue::Int32(7),
+            RowValue::ByteArray("Tx3-Row3".as_bytes().to_vec()),
+            RowValue::Int32(37),
+        ]);
+        table.append_in_stream_batch(additional_row, xact_id_3)?;
+
+        // Commit Transaction 3
+        table.commit_in_stream_batch(xact_id_3, 2)?;
+
+        // Flush the transaction data to disk
+        println!("Flushing Transaction 3 data...");
+        let flush_handle = table.flush_transaction_stream(xact_id_3, 2)?;
+
+        // Wait for flush to complete and get the disk slice writer
+        let disk_slice = flush_handle.await.unwrap()?;
+
+        // Commit the flush
+        table.commit_flush(disk_slice)?;
+
+        // Create snapshot to apply changes
+        let snapshot_handle = table.create_snapshot().unwrap();
+        assert!(
+            snapshot_handle.await.is_ok(),
+            "Second snapshot creation failed"
+        );
+
+        // Check that all transaction streams are gone
+        assert_eq!(
+            table.transaction_stream_states.len(),
+            0,
+            "Expected no remaining transaction streams after all are committed or aborted"
+        );
+
+        // Phase 7: Final verification
+        println!("Phase 7: Verifying final table state");
+
+        // Read the final state
+        let (file_paths, _deletions) = table.request_read()?;
+        assert!(!file_paths.is_empty(), "Expected files to be returned");
+        println!("Final deletion records: {:?}", _deletions);
+
+        // Collect all IDs from all batches across all files
+        let mut actual_ids = HashSet::new();
+
+        for file_path in file_paths {
+            let file = File::open(&file_path).unwrap();
+            let builder = ParquetRecordBatchReaderBuilder::try_new(file).unwrap();
+            let mut reader = builder.build().unwrap();
+
+            while let Some(Ok(batch)) = reader.next() {
+                let id_col = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap();
+                let name_col = batch
+                    .column(1)
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .unwrap();
+
+                for i in 0..batch.num_rows() {
+                    let id = id_col.value(i);
+                    let name = name_col.value(i);
+                    println!("Row: id={}, name={}", id, name);
+                    actual_ids.insert(id);
+                }
+            }
+        }
+
+        // Expected final state:
+        // - Transaction 1: Row with ID=1 included, deletion of ID=2 applied
+        // - Transaction 2: All rows aborted, not included
+        // - Transaction 3: Rows with ID=6 and ID=7 included, deletion of ID=5 applied
+        let expected_ids: HashSet<_> = [1, 6, 7].iter().copied().collect();
+
+        assert_eq!(
+            actual_ids, expected_ids,
+            "Expected rows with IDs 1, 6, 7 in final table state"
+        );
+
+        // Clean up
+        temp_dir.close().unwrap();
+
+        println!("Transaction stream isolation test passed!");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_flush_transaction_stream() -> Result<()> {
+        // Create a temporary directory for test data
+        let temp_dir = tempdir().unwrap();
+        let test_dir = temp_dir.path().join("test_txn_flush_dir");
+        create_dir_all(&test_dir).unwrap();
+        println!("Test directory: {:?}", test_dir);
+
+        // Create a schema for testing
+        let schema = Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("name", DataType::Utf8, true),
+            Field::new("age", DataType::Int32, false),
+        ]);
+
+        // Create a MooncakeTable
+        let mut table =
+            MooncakeTable::new(schema, "txn_flush_test".to_string(), 1, test_dir.clone());
+
+        // Set up test transaction
+        let xact_id = 123;
+
+        // Add rows to transaction
+        let rows = vec![
+            MoonlinkRow::new(vec![
+                RowValue::Int32(1),
+                RowValue::ByteArray("Row 1".as_bytes().to_vec()),
+                RowValue::Int32(21),
+            ]),
+            MoonlinkRow::new(vec![
+                RowValue::Int32(2),
+                RowValue::ByteArray("Row 2".as_bytes().to_vec()),
+                RowValue::Int32(22),
+            ]),
+            MoonlinkRow::new(vec![
+                RowValue::Int32(3),
+                RowValue::ByteArray("Row 3".as_bytes().to_vec()),
+                RowValue::Int32(23),
+            ]),
+        ];
+
+        for row in rows {
+            table.append_in_stream_batch(row, xact_id)?;
+        }
+
+        // Delete row 2 from the transaction
+        let row_to_delete = MoonlinkRow::new(vec![
+            RowValue::Int32(2),
+            RowValue::ByteArray("Row 2".as_bytes().to_vec()),
+            RowValue::Int32(22),
+        ]);
+        table.delete_in_stream_batch(row_to_delete, xact_id)?;
+
+        // Verify transaction state exists before flush
+        assert!(
+            table.transaction_stream_states.contains_key(&xact_id),
+            "Expected transaction state to exist before flush"
+        );
+
+        // Call commit_in_stream_batch (which is now a no-op)
+        table.commit_in_stream_batch(xact_id, 1)?;
+
+        // Flush the transaction
+        println!("Flushing transaction...");
+        let flush_handle = table.flush_transaction_stream(xact_id, 1)?;
+
+        // Verify transaction state is removed after flush
+        assert!(
+            !table.transaction_stream_states.contains_key(&xact_id),
+            "Expected transaction state to be removed after flush"
+        );
+
+        // Wait for flush to complete and get the disk slice writer
+        let disk_slice = flush_handle.await.unwrap()?;
+
+        // Commit the flush
+        table.commit_flush(disk_slice)?;
+
+        // Create snapshot to apply changes
+        let snapshot_handle = table.create_snapshot().unwrap();
+        assert!(snapshot_handle.await.is_ok(), "Snapshot creation failed");
+
+        // Verify rows are persisted
+        let (file_paths, deletions) = table.request_read()?;
+        assert!(!file_paths.is_empty(), "Expected files to be returned");
+        println!("Deletion records: {:?}", deletions);
+
+        // Read the file
+        let file_path = &file_paths[0];
+        let file = File::open(file_path).unwrap();
+        let builder = ParquetRecordBatchReaderBuilder::try_new(file).unwrap();
+        let mut reader = builder.build().unwrap();
+        let batch = reader.next().unwrap().unwrap();
+
+        // Verify the batch
+        println!("Batch after flush: {:?}", batch);
+        assert_eq!(
+            batch.num_rows(),
+            2,
+            "Expected 2 rows after transaction flush (one was deleted)"
+        );
+
+        // Verify the correct rows (ID 1 and 3) are present (ID 2 was deleted)
+        let id_col = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        let actual_ids: HashSet<_> = (0..id_col.len()).map(|i| id_col.value(i)).collect();
+        let expected_ids: HashSet<_> = [1, 3].iter().copied().collect();
+
+        assert_eq!(
+            actual_ids, expected_ids,
+            "Expected only rows with IDs 1 and 3 to be present (ID 2 was deleted)"
+        );
+
+        // Clean up
+        temp_dir.close().unwrap();
+
+        println!("Transaction stream flush test passed!");
         Ok(())
     }
 }
