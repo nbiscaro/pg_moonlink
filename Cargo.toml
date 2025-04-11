@@ -14,9 +14,9 @@ edition = "2021"
 [workspace.dependencies]
 async-trait = "0.1"
 
-pg_replicate = { git = "https://github.com/Mooncake-Labs/pg_replicate", rev = "b80f6905239e04a150bb788ba0f5b1f1ae0b9b15" }
+pg_replicate = { git = "https://github.com/Mooncake-Labs/pg_replicate", rev = "6185151c9746cece94fa2bb3792bbd536ac35b93" }
+tokio-postgres = { git = "ssh://git@github.com/Mooncake-Labs/rust-postgres.git", package = "tokio-postgres" }
 tokio.version = "1.38"
-tokio-postgres = { git = "https://github.com/imor/rust-postgres", rev = "20265ef38e32a06f76b6f9b678e2077fc2211f6b" }
 arrow = "54.2.1"
 thiserror = "2.0.12"
 parquet = "54.2.1"
