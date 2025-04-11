@@ -436,7 +436,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_table_handler_streaming() {
+    async fn test_streaming_append_and_commit() {
         // Create a schema for testing
         let schema = Schema::new(vec![
             Field::new("id", DataType::Int32, false),
@@ -451,63 +451,35 @@ mod tests {
         let handler = TableHandler::new(schema, "test_table".to_string(), 1, path);
         let event_sender = handler.get_event_sender();
 
-        // 1. Test transaction append with a specific xact_id
-        let xact_id_1 = 101;
+        // Test transaction append with a specific xact_id
+        let xact_id = 101;
 
-        // Create some rows to append in the transaction
-        let rows_to_append = vec![
-            MoonlinkRow::new(vec![
-                RowValue::Int32(10),
-                RowValue::ByteArray("Transaction1-User1".as_bytes().to_vec()),
-                RowValue::Int32(25),
-            ]),
-            MoonlinkRow::new(vec![
-                RowValue::Int32(11),
-                RowValue::ByteArray("Transaction1-User2".as_bytes().to_vec()),
-                RowValue::Int32(30),
-            ]),
-        ];
-
-        // Append rows to the transaction
-        for row in rows_to_append {
-            event_sender
-                .send(TableEvent::Append {
-                    row,
-                    xact_id: Some(xact_id_1),
-                })
-                .await
-                .unwrap();
-        }
-
-        // 2. Test transaction delete with the same xact_id
-        let row_to_delete = MoonlinkRow::new(vec![
+        // Create rows to append in the transaction
+        let row = MoonlinkRow::new(vec![
             RowValue::Int32(10),
-            RowValue::ByteArray("Transaction1-User1".as_bytes().to_vec()),
+            RowValue::ByteArray("Transaction-User".as_bytes().to_vec()),
             RowValue::Int32(25),
         ]);
 
+        // Append row to the transaction
         event_sender
-            .send(TableEvent::Delete {
-                row: row_to_delete,
-                lsn: 100,
-                xact_id: Some(xact_id_1),
+            .send(TableEvent::Append {
+                row,
+                xact_id: Some(xact_id),
             })
             .await
             .unwrap();
 
-        // 3. Commit the transaction
+        // Commit the transaction
         event_sender
-            .send(TableEvent::StreamCommit {
-                lsn: 101,
-                xact_id: xact_id_1,
-            })
+            .send(TableEvent::StreamCommit { lsn: 101, xact_id })
             .await
             .unwrap();
 
         // Wait for commit to complete
         tokio::time::sleep(Duration::from_secs(1)).await;
 
-        // 4. Read and verify the data
+        // Read and verify the data
         let (tx, rx) = oneshot::channel();
         event_sender
             .send(TableEvent::PrepareRead {
@@ -516,11 +488,10 @@ mod tests {
             .await
             .unwrap();
 
-        // Verify the committed transaction (should only have one row - User2)
+        // Verify the committed transaction
         match tokio::time::timeout(Duration::from_secs(1), rx).await {
-            Ok(Ok((paths, deletions))) => {
-                println!("Received snapshot paths after commit: {:?}", paths);
-                println!("Deletions after commit: {:?}", deletions);
+            Ok(Ok((paths, _deletions))) => {
+                println!("Received snapshot paths: {:?}", paths);
 
                 if paths.is_empty() {
                     println!("Warning: No snapshot files returned");
@@ -534,8 +505,17 @@ mod tests {
                             println!("Converted arrow schema is: {}", builder.schema());
                             let mut reader = builder.build().unwrap();
                             let record_batch = reader.next();
-                            println!("Record batch after commit: {:?}", record_batch);
-                            // Note: In a real test, we would assert that user1 is deleted and only user2 remains
+                            println!("Record batch: {:?}", record_batch);
+
+                            // Check that the record batch contains the expected row
+                            if let Some(Ok(batch)) = record_batch {
+                                assert_eq!(
+                                    batch.num_rows(),
+                                    1,
+                                    "Expected one row in the record batch"
+                                );
+                                // In a more robust test, we'd check the actual values
+                            }
                         } else {
                             println!("Warning: Snapshot file does not exist at {:?}", path);
                         }
@@ -546,13 +526,184 @@ mod tests {
             Err(_) => println!("Timed out waiting for prepare read response"),
         }
 
-        // 5. Test transaction abort
-        // Create another transaction with a different xact_id
-        let xact_id_2 = 102;
+        // Shutdown the handler
+        event_sender.send(TableEvent::_Shutdown).await.unwrap();
+        if let Some(handle) = handler._event_handle {
+            handle.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn test_streaming_delete() {
+        // Create a schema for testing
+        let schema = Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("name", DataType::Utf8, true),
+            Field::new("age", DataType::Int32, false),
+        ]);
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let path = temp_dir.path().to_path_buf();
+
+        // Create a TableHandler
+        let handler = TableHandler::new(schema, "test_table".to_string(), 1, path);
+        let event_sender = handler.get_event_sender();
+
+        let xact_id = 101;
+
+        // Create rows to append in the transaction
+        let rows_to_append = vec![
+            MoonlinkRow::new(vec![
+                RowValue::Int32(10),
+                RowValue::ByteArray("Transaction-User1".as_bytes().to_vec()),
+                RowValue::Int32(25),
+            ]),
+            MoonlinkRow::new(vec![
+                RowValue::Int32(11),
+                RowValue::ByteArray("Transaction-User2".as_bytes().to_vec()),
+                RowValue::Int32(30),
+            ]),
+        ];
+
+        // Append rows to the transaction
+        for row in rows_to_append {
+            event_sender
+                .send(TableEvent::Append {
+                    row,
+                    xact_id: Some(xact_id),
+                })
+                .await
+                .unwrap();
+        }
+
+        // Delete one of the rows within the same transaction
+        let row_to_delete = MoonlinkRow::new(vec![
+            RowValue::Int32(10),
+            RowValue::ByteArray("Transaction-User1".as_bytes().to_vec()),
+            RowValue::Int32(25),
+        ]);
+
+        event_sender
+            .send(TableEvent::Delete {
+                row: row_to_delete,
+                lsn: 100,
+                xact_id: Some(xact_id),
+            })
+            .await
+            .unwrap();
+
+        // Commit the transaction
+        event_sender
+            .send(TableEvent::StreamCommit { lsn: 101, xact_id })
+            .await
+            .unwrap();
+
+        // Wait for commit to complete
+        tokio::time::sleep(Duration::from_secs(1)).await;
+
+        // Read and verify the data
+        let (tx, rx) = oneshot::channel();
+        event_sender
+            .send(TableEvent::PrepareRead {
+                response_channel: tx,
+            })
+            .await
+            .unwrap();
+
+        // Verify the committed transaction (should only have User2)
+        match tokio::time::timeout(Duration::from_secs(1), rx).await {
+            Ok(Ok((paths, deletions))) => {
+                println!("Received snapshot paths: {:?}", paths);
+                println!("Deletions: {:?}", deletions);
+
+                if paths.is_empty() {
+                    println!("Warning: No snapshot files returned");
+                } else {
+                    // Verify that the paths exist
+                    for path in paths {
+                        if path.exists() {
+                            println!("Confirmed snapshot file exists: {:?}", path);
+                            let file = File::open(&path).unwrap();
+                            let builder = ParquetRecordBatchReaderBuilder::try_new(file).unwrap();
+                            println!("Converted arrow schema is: {}", builder.schema());
+                            let mut reader = builder.build().unwrap();
+                            let record_batch = reader.next();
+                            println!("Record batch: {:?}", record_batch);
+
+                            // Check that the record batch contains only User2
+                            if let Some(Ok(batch)) = record_batch {
+                                assert_eq!(
+                                    batch.num_rows(),
+                                    1,
+                                    "Expected one row in the record batch"
+                                );
+                                // In a more robust test, we'd verify that it's User2 and not User1
+                            }
+                        } else {
+                            println!("Warning: Snapshot file does not exist at {:?}", path);
+                        }
+                    }
+                }
+            }
+            Ok(Err(_)) => println!("Response channel was dropped"),
+            Err(_) => println!("Timed out waiting for prepare read response"),
+        }
+
+        // Shutdown the handler
+        event_sender.send(TableEvent::_Shutdown).await.unwrap();
+        if let Some(handle) = handler._event_handle {
+            handle.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn test_streaming_abort() {
+        // Create a schema for testing
+        let schema = Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("name", DataType::Utf8, true),
+            Field::new("age", DataType::Int32, false),
+        ]);
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let path = temp_dir.path().to_path_buf();
+
+        // Create a TableHandler
+        let handler = TableHandler::new(schema, "test_table".to_string(), 1, path);
+        let event_sender = handler.get_event_sender();
+
+        // First, add and commit a baseline row to verify against
+        let baseline_xact_id = 100;
+        let baseline_row = MoonlinkRow::new(vec![
+            RowValue::Int32(1),
+            RowValue::ByteArray("Baseline-User".as_bytes().to_vec()),
+            RowValue::Int32(20),
+        ]);
+
+        event_sender
+            .send(TableEvent::Append {
+                row: baseline_row,
+                xact_id: Some(baseline_xact_id),
+            })
+            .await
+            .unwrap();
+
+        event_sender
+            .send(TableEvent::StreamCommit {
+                lsn: 100,
+                xact_id: baseline_xact_id,
+            })
+            .await
+            .unwrap();
+
+        tokio::time::sleep(Duration::from_secs(1)).await;
+
+        // Now create a transaction that will be aborted
+        let abort_xact_id = 102;
 
         let abort_row = MoonlinkRow::new(vec![
             RowValue::Int32(20),
-            RowValue::ByteArray("Transaction2-UserAborted".as_bytes().to_vec()),
+            RowValue::ByteArray("Transaction-UserToAbort".as_bytes().to_vec()),
             RowValue::Int32(40),
         ]);
 
@@ -560,21 +711,23 @@ mod tests {
         event_sender
             .send(TableEvent::Append {
                 row: abort_row,
-                xact_id: Some(xact_id_2),
+                xact_id: Some(abort_xact_id),
             })
             .await
             .unwrap();
 
         // Abort the transaction
         event_sender
-            .send(TableEvent::StreamAbort { xact_id: xact_id_2 })
+            .send(TableEvent::StreamAbort {
+                xact_id: abort_xact_id,
+            })
             .await
             .unwrap();
 
         // Wait for abort to complete
         tokio::time::sleep(Duration::from_secs(1)).await;
 
-        // 6. Read and verify the data again
+        // Read and verify the data
         let (tx, rx) = oneshot::channel();
         event_sender
             .send(TableEvent::PrepareRead {
@@ -583,29 +736,34 @@ mod tests {
             .await
             .unwrap();
 
-        // Verify the data after abort (should still only have User2, not the aborted row)
+        // Verify that only the baseline data exists and aborted transaction data is not present
         match tokio::time::timeout(Duration::from_secs(1), rx).await {
-            Ok(Ok((paths, deletions))) => {
-                println!("Received snapshot paths after abort: {:?}", paths);
-                println!("Deletions after abort: {:?}", deletions);
+            Ok(Ok((paths, _deletions))) => {
+                println!("Received snapshot paths: {:?}", paths);
 
                 if paths.is_empty() {
-                    println!("Warning: No snapshot files returned after abort");
+                    println!("Warning: No snapshot files returned");
                 } else {
                     // Verify that the paths exist
                     for path in paths {
                         if path.exists() {
-                            println!("Confirmed snapshot file exists after abort: {:?}", path);
+                            println!("Confirmed snapshot file exists: {:?}", path);
                             let file = File::open(&path).unwrap();
                             let builder = ParquetRecordBatchReaderBuilder::try_new(file).unwrap();
-                            println!(
-                                "Converted arrow schema after abort is: {}",
-                                builder.schema()
-                            );
+                            println!("Converted arrow schema is: {}", builder.schema());
                             let mut reader = builder.build().unwrap();
                             let record_batch = reader.next();
-                            println!("Record batch after abort: {:?}", record_batch);
-                            // Note: In a real test, we would assert that the aborted transaction data is not present
+                            println!("Record batch: {:?}", record_batch);
+
+                            // Check that only the baseline row exists
+                            if let Some(Ok(batch)) = record_batch {
+                                assert_eq!(
+                                    batch.num_rows(),
+                                    1,
+                                    "Expected one row in the record batch"
+                                );
+                                // In a more robust test, we'd check it's the baseline row
+                            }
                         } else {
                             println!("Warning: Snapshot file does not exist at {:?}", path);
                         }
@@ -616,58 +774,81 @@ mod tests {
             Err(_) => println!("Timed out waiting for prepare read response"),
         }
 
-        // 7. Test a more complex scenario: concurrent transactions
-        let xact_id_3 = 103;
-        let xact_id_4 = 104;
+        // Shutdown the handler
+        event_sender.send(TableEvent::_Shutdown).await.unwrap();
+        if let Some(handle) = handler._event_handle {
+            handle.await.unwrap();
+        }
+    }
 
-        // First transaction: add one row
-        let tx3_row = MoonlinkRow::new(vec![
+    #[tokio::test]
+    async fn test_concurrent_streaming_transactions() {
+        // Create a schema for testing
+        let schema = Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("name", DataType::Utf8, true),
+            Field::new("age", DataType::Int32, false),
+        ]);
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let path = temp_dir.path().to_path_buf();
+
+        // Create a TableHandler
+        let handler = TableHandler::new(schema, "test_table".to_string(), 1, path);
+        let event_sender = handler.get_event_sender();
+
+        // Create two concurrent transactions
+        let xact_id_1 = 103;
+        let xact_id_2 = 104;
+
+        // Transaction 1: add one row
+        let tx1_row = MoonlinkRow::new(vec![
             RowValue::Int32(30),
-            RowValue::ByteArray("Transaction3-User".as_bytes().to_vec()),
+            RowValue::ByteArray("Transaction1-User".as_bytes().to_vec()),
             RowValue::Int32(35),
         ]);
 
         event_sender
             .send(TableEvent::Append {
-                row: tx3_row,
-                xact_id: Some(xact_id_3),
+                row: tx1_row,
+                xact_id: Some(xact_id_1),
             })
             .await
             .unwrap();
 
-        // Second transaction: add one row
-        let tx4_row = MoonlinkRow::new(vec![
+        // Transaction 2: add one row
+        let tx2_row = MoonlinkRow::new(vec![
             RowValue::Int32(40),
-            RowValue::ByteArray("Transaction4-User".as_bytes().to_vec()),
+            RowValue::ByteArray("Transaction2-User".as_bytes().to_vec()),
             RowValue::Int32(45),
         ]);
 
         event_sender
             .send(TableEvent::Append {
-                row: tx4_row,
-                xact_id: Some(xact_id_4),
+                row: tx2_row,
+                xact_id: Some(xact_id_2),
             })
             .await
             .unwrap();
 
-        // Commit transaction 3, abort transaction 4
+        // Commit transaction 1, abort transaction 2
         event_sender
             .send(TableEvent::StreamCommit {
                 lsn: 103,
-                xact_id: xact_id_3,
+                xact_id: xact_id_1,
             })
             .await
             .unwrap();
 
         event_sender
-            .send(TableEvent::StreamAbort { xact_id: xact_id_4 })
+            .send(TableEvent::StreamAbort { xact_id: xact_id_2 })
             .await
             .unwrap();
 
         // Wait for operations to complete
         tokio::time::sleep(Duration::from_secs(1)).await;
 
-        // Final read to verify all operations
+        // Read and verify the data
         let (tx, rx) = oneshot::channel();
         event_sender
             .send(TableEvent::PrepareRead {
@@ -676,11 +857,10 @@ mod tests {
             .await
             .unwrap();
 
-        // Verify final state (should have User2 from transaction 1 and User from transaction 3)
+        // Verify final state (should only have Transaction1-User, not Transaction2-User)
         match tokio::time::timeout(Duration::from_secs(1), rx).await {
-            Ok(Ok((paths, deletions))) => {
+            Ok(Ok((paths, _deletions))) => {
                 println!("Received final snapshot paths: {:?}", paths);
-                println!("Final deletions: {:?}", deletions);
 
                 if paths.is_empty() {
                     println!("Warning: No final snapshot files returned");
@@ -694,7 +874,16 @@ mod tests {
                             let mut reader = builder.build().unwrap();
                             let record_batch = reader.next();
                             println!("Final record batch: {:?}", record_batch);
-                            // In a real test, we would verify that only rows from committed transactions exist
+
+                            // Check that only the committed transaction data is present
+                            if let Some(Ok(batch)) = record_batch {
+                                assert_eq!(
+                                    batch.num_rows(),
+                                    1,
+                                    "Expected one row in the record batch"
+                                );
+                                // In a more robust test, we'd verify it's Transaction1-User
+                            }
                         } else {
                             println!("Warning: Final snapshot file does not exist at {:?}", path);
                         }
@@ -707,12 +896,8 @@ mod tests {
 
         // Shutdown the handler
         event_sender.send(TableEvent::_Shutdown).await.unwrap();
-
-        // Wait for event handler to exit
         if let Some(handle) = handler._event_handle {
             handle.await.unwrap();
         }
-
-        println!("All table handler streaming tests passed!");
     }
 }
