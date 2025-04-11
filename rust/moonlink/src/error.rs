@@ -15,6 +15,9 @@ pub enum Error {
 
     #[error("Parquet error: {0}")]
     Parquet(#[from] ParquetError),
+
+    #[error("Transaction {0} not found")]
+    TransactionNotFound(u32),
 }
 
 pub type Result<T> = result::Result<T, Error>;
