@@ -82,6 +82,7 @@ impl BatchSink for Sink {
             event_sender
                 .send(TableEvent::Append {
                     row: PostgresTableRow(row).into(),
+                    xact_id: None,
                 })
                 .await
                 .unwrap();
@@ -105,6 +106,9 @@ impl BatchSink for Sink {
                 CdcEvent::Begin(begin_body) => {
                     lsn_in_transaction = Some(begin_body.final_lsn());
                 }
+                CdcEvent::StreamStart(stream_start_body) => {
+                    println!("Stream start {stream_start_body:?}");
+                }
                 CdcEvent::Commit(commit_body) => {
                     if let Some(table_id) = table_id_in_transaction {
                         let event_sender = self.event_senders.get_mut(&table_id).unwrap();
@@ -117,7 +121,19 @@ impl BatchSink for Sink {
                         table_id_in_transaction = None;
                     }
                 }
-                CdcEvent::Insert((table_id, table_row)) => {
+                CdcEvent::StreamCommit(stream_commit_body) => {
+                    if let Some(table_id) = table_id_in_transaction {
+                        let event_sender = self.event_senders.get_mut(&table_id).unwrap();
+                        event_sender
+                            .send(TableEvent::StreamCommit {
+                                lsn: stream_commit_body.commit_lsn(),
+                                xact_id: stream_commit_body.xid(),
+                            })
+                            .await
+                            .unwrap();
+                    }
+                }
+                CdcEvent::Insert((table_id, table_row, xact_id)) => {
                     if let Some(prev_id) = table_id_in_transaction {
                         assert!(
                             prev_id == table_id,
@@ -129,11 +145,12 @@ impl BatchSink for Sink {
                     event_sender
                         .send(TableEvent::Append {
                             row: PostgresTableRow(table_row).into(),
+                            xact_id,
                         })
                         .await
                         .unwrap();
                 }
-                CdcEvent::Update((table_id, old_table_row, new_table_row)) => {
+                CdcEvent::Update((table_id, old_table_row, new_table_row, xact_id)) => {
                     if let Some(prev_id) = table_id_in_transaction {
                         assert!(
                             prev_id == table_id,
@@ -146,17 +163,19 @@ impl BatchSink for Sink {
                         .send(TableEvent::Delete {
                             row: PostgresTableRow(old_table_row.unwrap()).into(),
                             lsn: (lsn_in_transaction.unwrap()),
+                            xact_id,
                         })
                         .await
                         .unwrap();
                     event_sender
                         .send(TableEvent::Append {
                             row: PostgresTableRow(new_table_row).into(),
+                            xact_id,
                         })
                         .await
                         .unwrap();
                 }
-                CdcEvent::Delete((table_id, table_row)) => {
+                CdcEvent::Delete((table_id, table_row, xact_id)) => {
                     if let Some(prev_id) = table_id_in_transaction {
                         assert!(
                             prev_id == table_id,
@@ -169,6 +188,7 @@ impl BatchSink for Sink {
                         .send(TableEvent::Delete {
                             row: PostgresTableRow(table_row).into(),
                             lsn: (lsn_in_transaction.unwrap()),
+                            xact_id,
                         })
                         .await
                         .unwrap();
@@ -176,6 +196,20 @@ impl BatchSink for Sink {
                 CdcEvent::Relation(relation_body) => println!("Relation {relation_body:?}"),
                 CdcEvent::Type(type_body) => println!("Type {type_body:?}"),
                 CdcEvent::KeepAliveRequested { .. } => {}
+                CdcEvent::StreamStop(stream_stop_body) => {
+                    println!("Stream stop {stream_stop_body:?}");
+                }
+                CdcEvent::StreamAbort(stream_abort_body) => {
+                    if let Some(table_id) = table_id_in_transaction {
+                        let event_sender = self.event_senders.get_mut(&table_id).unwrap();
+                        event_sender
+                            .send(TableEvent::StreamAbort {
+                                xact_id: stream_abort_body.xid(),
+                            })
+                            .await
+                            .unwrap();
+                    }
+                }
             }
         }
         Ok(PgLsn::from(0))
