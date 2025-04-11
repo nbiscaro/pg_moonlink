@@ -13,11 +13,22 @@ use tokio::time::{self, Duration};
 #[derive(Debug)]
 pub enum TableEvent {
     /// Append a row to the table
-    Append { row: MoonlinkRow },
+    Append {
+        row: MoonlinkRow,
+        xact_id: Option<u32>,
+    },
     /// Delete a row from the table
-    Delete { row: MoonlinkRow, lsn: u64 },
+    Delete {
+        row: MoonlinkRow,
+        lsn: u64,
+        xact_id: Option<u32>,
+    },
     /// Commit all pending operations with a given LSN
     Commit { lsn: u64 },
+    /// Commit all pending operations with given LSN and xact_id
+    StreamCommit { lsn: u64, xact_id: u32 },
+    /// Abort current stream with given xact_id
+    StreamAbort { xact_id: u32 },
     /// Prepare the table for reading
     PrepareRead {
         response_channel: oneshot::Sender<(Vec<PathBuf>, Vec<(usize, usize)>)>,
@@ -88,14 +99,22 @@ impl TableHandler {
                 // Process events from the queue
                 Some(event) = event_receiver.recv() => {
                     match event {
-                        TableEvent::Append { row } => {
-                            if let Err(e) = table.append(row) {
-                                println!("Append failed: {}", e);
+                        TableEvent::Append { row, xact_id } => {
+                            let result = match xact_id {
+                                Some(xact_id) => table.append_in_stream_batch(row, xact_id),
+                                None => table.append(row),
+                            };
+
+                            if let Err(e) = result {
+                                println!("Failed to append row: {}", e);
                             }
                         }
 
-                        TableEvent::Delete { row, lsn } => {
-                            table.delete(row, lsn);
+                        TableEvent::Delete { row, lsn, xact_id } => {
+                            match xact_id {
+                                Some(xact_id) => table.delete_in_stream_batch(row, xact_id),
+                                None => table.delete(row, lsn),
+                            };
                         }
 
                         TableEvent::Commit { lsn } => {
@@ -103,6 +122,21 @@ impl TableHandler {
                             if table.should_flush() {
                                 flush_handle = Some(table.flush(lsn));
                             }
+                        }
+
+                        TableEvent::StreamCommit { lsn, xact_id } => {
+                            match table.flush_transaction_stream(xact_id, lsn) {
+                                Ok(writer) => {
+                                    flush_handle = Some(writer);
+                                }
+                                Err(e) => {
+                                    println!("Stream commit failed: {}", e);
+                                }
+                            }
+                        }
+
+                        TableEvent::StreamAbort { xact_id } => {
+                            table.abort_in_stream_batch(xact_id);
                         }
 
                         TableEvent::PrepareRead { response_channel } => {
@@ -228,7 +262,10 @@ mod tests {
         ]);
 
         event_sender
-            .send(TableEvent::Append { row: row1 })
+            .send(TableEvent::Append {
+                row: row1,
+                xact_id: None,
+            })
             .await
             .unwrap();
 
@@ -326,7 +363,10 @@ mod tests {
 
         // Append all rows
         for row in rows {
-            event_sender.send(TableEvent::Append { row }).await.unwrap();
+            event_sender
+                .send(TableEvent::Append { row, xact_id: None })
+                .await
+                .unwrap();
         }
 
         // Commit the changes
