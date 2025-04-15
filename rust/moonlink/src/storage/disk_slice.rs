@@ -159,11 +159,9 @@ impl DiskSliceWriter {
     }
 
     pub fn remap_deletion_if_needed(&self, deletion: &mut ProcessedDeletionRecord) {
-        // needs remap if:
-        // 1. the deletion still has an in memory position
-        // 2. the batch id is in the batch_id_to_idx map indicating that it was since flushed
         if let RecordLocation::MemoryBatch(batch_id, row_idx) = &deletion.pos {
-            if self.batch_id_to_idx.contains_key(batch_id) {
+            let batch_was_flushed = self.batch_id_to_idx.contains_key(batch_id);
+            if batch_was_flushed {
                 let old_location = (*self.batch_id_to_idx.get(batch_id).unwrap(), *row_idx);
                 let new_location = self.row_offset_mapping.get(&old_location).unwrap();
                 deletion.pos = RecordLocation::DiskFile(
