@@ -532,13 +532,17 @@ impl MooncakeTable {
     fn commit_deletion(snapshot: &mut SnapshotTableState, deletion: ProcessedDeletionRecord) {
         match &deletion.pos {
             RecordLocation::MemoryBatch(batch_id, row_id) => {
-                let res = snapshot
-                    .batches
-                    .get_mut(&batch_id)
-                    .unwrap()
-                    .deletions
-                    .delete_row(*row_id);
-                assert!(res);
+                if snapshot.batches.contains_key(batch_id) {
+                    // Possible we deleted an in memory row that was flushed
+
+                    let res = snapshot
+                        .batches
+                        .get_mut(&batch_id)
+                        .unwrap()
+                        .deletions
+                        .delete_row(*row_id);
+                    assert!(res);
+                }
             }
             RecordLocation::DiskFile(file_name, row_id) => {
                 let res = snapshot
@@ -1121,6 +1125,180 @@ mod tests {
         temp_dir.close().unwrap();
 
         println!("Deletions test passed!");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_deletion_snapshot_ordering() -> Result<()> {
+        // Test to verify if the order of operations (delete→snapshot→flush vs delete→flush→snapshot)
+        // affects deletion handling
+
+        // Common setup for both scenarios
+        fn setup_test_table(test_dir: &Path) -> Result<MooncakeTable> {
+            let schema = Schema::new(vec![
+                Field::new("id", DataType::Int32, false),
+                Field::new("name", DataType::Utf8, true),
+                Field::new("age", DataType::Int32, false),
+            ]);
+
+            let mut table = MooncakeTable::new(
+                schema,
+                "test_ordering".to_string(),
+                1,
+                test_dir.to_path_buf(),
+            );
+
+            // Add initial data: 3 rows
+            let rows = vec![
+                MoonlinkRow::new(vec![
+                    RowValue::Int32(1),
+                    RowValue::ByteArray("Row 1".as_bytes().to_vec()),
+                    RowValue::Int32(31),
+                ]),
+                MoonlinkRow::new(vec![
+                    RowValue::Int32(2),
+                    RowValue::ByteArray("Row 2".as_bytes().to_vec()),
+                    RowValue::Int32(32),
+                ]),
+                MoonlinkRow::new(vec![
+                    RowValue::Int32(3),
+                    RowValue::ByteArray("Row 3".as_bytes().to_vec()),
+                    RowValue::Int32(33),
+                ]),
+            ];
+
+            for row in rows {
+                table.append(row)?;
+            }
+            table.commit(1);
+
+            Ok(table)
+        }
+
+        // Helper function to verify table state
+        async fn verify_table_state(table: &MooncakeTable, expected_rows: &[i32]) -> Result<()> {
+            let (file_paths, deletions) = table.request_read()?;
+            assert!(!file_paths.is_empty(), "Expected files to be returned");
+            println!("Deletion records: {:?}", deletions);
+
+            // Read the generated file and verify content
+            let file_path = &file_paths[0];
+            let file = File::open(file_path).unwrap();
+            let builder = ParquetRecordBatchReaderBuilder::try_new(file).unwrap();
+            let mut reader = builder.build().unwrap();
+            let batch = reader.next().unwrap().unwrap();
+
+            let id_col = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
+
+            // Check if we have the expected row count
+            assert_eq!(
+                id_col.len(),
+                expected_rows.len(),
+                "Expected {} rows, found {}",
+                expected_rows.len(),
+                id_col.len()
+            );
+
+            // Check if we have the expected IDs
+            let actual: HashSet<_> = (0..id_col.len()).map(|i| id_col.value(i)).collect();
+            let expected: HashSet<_> = expected_rows.iter().copied().collect();
+            assert_eq!(
+                actual, expected,
+                "Expected row IDs {:?}, found {:?}",
+                expected, actual
+            );
+
+            Ok(())
+        }
+
+        // Create a temporary directory for test data
+        let temp_dir = tempdir().unwrap();
+        let test_dir = temp_dir.path().join("test_deletion_snapshot_ordering");
+        create_dir_all(&test_dir).unwrap();
+
+        // Scenario 1: delete → snapshot → flush
+        println!("\n--- Testing Scenario 1: delete → snapshot → flush ---");
+        let scenario1_dir = test_dir.join("scenario1");
+        create_dir_all(&scenario1_dir).unwrap();
+
+        let mut table1 = setup_test_table(&scenario1_dir)?;
+
+        // Delete row 2
+        println!("Deleting row with ID 2");
+        let delete_row = MoonlinkRow::new(vec![
+            RowValue::Int32(2),
+            RowValue::ByteArray("Row 2".as_bytes().to_vec()),
+            RowValue::Int32(32),
+        ]);
+        table1.delete(delete_row, 2);
+        table1.commit(2);
+
+        // Take a snapshot
+        println!("Taking snapshot before flush");
+        let snapshot_handle = table1.create_snapshot().unwrap();
+        assert!(snapshot_handle.await.is_ok(), "Snapshot creation failed");
+
+        // Verify state after snapshot
+        println!("Verifying state after delete and snapshot (before flush)");
+        verify_table_state(&table1, &[1, 3]).await?;
+
+        // Flush
+        println!("Flushing table");
+        let flush_handle = table1.flush(2);
+        let disk_slice = flush_handle.await.unwrap()?;
+        table1.commit_flush(disk_slice)?;
+
+        // Take another snapshot to apply flush
+        let snapshot_handle = table1.create_snapshot().unwrap();
+        assert!(
+            snapshot_handle.await.is_ok(),
+            "Post-flush snapshot creation failed"
+        );
+
+        // Verify final state
+        println!("Verifying state after flush");
+        verify_table_state(&table1, &[1, 3]).await?;
+
+        // Scenario 2: delete → flush → snapshot
+        println!("\n--- Testing Scenario 2: delete → flush → snapshot ---");
+        let scenario2_dir = test_dir.join("scenario2");
+        create_dir_all(&scenario2_dir).unwrap();
+
+        let mut table2 = setup_test_table(&scenario2_dir)?;
+
+        // Delete row 2
+        println!("Deleting row with ID 2");
+        let delete_row = MoonlinkRow::new(vec![
+            RowValue::Int32(2),
+            RowValue::ByteArray("Row 2".as_bytes().to_vec()),
+            RowValue::Int32(32),
+        ]);
+        table2.delete(delete_row, 2);
+        table2.commit(2);
+
+        // Flush without taking a snapshot first
+        println!("Flushing table before snapshot");
+        let flush_handle = table2.flush(2);
+        let disk_slice = flush_handle.await.unwrap()?;
+        table2.commit_flush(disk_slice)?;
+
+        // Now take a snapshot
+        println!("Taking snapshot after flush");
+        let snapshot_handle = table2.create_snapshot().unwrap();
+        assert!(snapshot_handle.await.is_ok(), "Snapshot creation failed");
+
+        // Verify state after snapshot
+        println!("Verifying state after flush and snapshot");
+        verify_table_state(&table2, &[1, 3]).await?;
+
+        // Clean up
+        temp_dir.close().unwrap();
+
+        println!("All tests completed!");
         Ok(())
     }
 }
