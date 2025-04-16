@@ -166,7 +166,7 @@ impl DiskSliceWriter {
                 // Guard the case where the record was deleted before making it to disk
                 if let Some(new_location) = self.row_offset_mapping.get(&old_location) {
                     deletion.pos = RecordLocation::DiskFile(
-                        FileId(Arc::new(self.files[new_location.0].clone())),
+                        FileId(Arc::new(self.files[new_location.0].0.clone())),
                         new_location.1,
                     );
                 }
