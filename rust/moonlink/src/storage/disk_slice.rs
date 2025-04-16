@@ -163,11 +163,13 @@ impl DiskSliceWriter {
             let batch_was_flushed = self.batch_id_to_idx.contains_key(batch_id);
             if batch_was_flushed {
                 let old_location = (*self.batch_id_to_idx.get(batch_id).unwrap(), *row_idx);
-                let new_location = self.row_offset_mapping.get(&old_location).unwrap();
-                deletion.pos = RecordLocation::DiskFile(
-                    FileId(Arc::new(self.files[new_location.0].0.clone())),
-                    new_location.1,
-                );
+                // Guard the case where the record was deleted before making it to disk
+                if let Some(new_location) = self.row_offset_mapping.get(&old_location) {
+                    deletion.pos = RecordLocation::DiskFile(
+                        FileId(Arc::new(self.files[new_location.0].clone())),
+                        new_location.1,
+                    );
+                }
             }
         }
     }
