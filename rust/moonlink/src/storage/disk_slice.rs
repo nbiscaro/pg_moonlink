@@ -293,12 +293,14 @@ mod tests {
             _row_identity: None,
             pos: Some((0, 1)),
             lsn: 1,
+            xact_id: None,
         }); // Delete Bob (ID 2)
         mem_slice.delete(&RawDeletionRecord {
             lookup_key: 4,
             _row_identity: None,
             pos: Some((0, 3)),
             lsn: 1,
+            xact_id: None,
         }); // Delete David (ID 4)
 
         let (_new_batch, entries, index) = mem_slice.flush().unwrap();

@@ -132,7 +132,8 @@ mod tests {
                 lookup_key: 2,
                 lsn: 0,
                 pos: None,
-                _row_identity: None
+                _row_identity: None,
+                xact_id: None,
             }),
             Some((0, 1))
         );
@@ -141,7 +142,8 @@ mod tests {
                 lookup_key: 3,
                 lsn: 0,
                 pos: None,
-                _row_identity: None
+                _row_identity: None,
+                xact_id: None
             }),
             Some((0, 2))
         );
@@ -150,7 +152,8 @@ mod tests {
                 lookup_key: 1,
                 lsn: 0,
                 pos: None,
-                _row_identity: None
+                _row_identity: None,
+                xact_id: None,
             }),
             Some((0, 0))
         );

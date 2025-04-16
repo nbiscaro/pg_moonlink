@@ -32,6 +32,7 @@ pub struct RawDeletionRecord {
     pub(crate) _row_identity: Option<RecordIdentity>,
     pub(crate) pos: Option<(u64, usize)>,
     pub(crate) lsn: u64,
+    pub(crate) xact_id: Option<u32>,
 }
 
 #[derive(Clone, Debug)]
@@ -39,6 +40,7 @@ pub struct ProcessedDeletionRecord {
     pub(crate) _lookup_key: i64,
     pub(crate) pos: RecordLocation,
     pub(crate) lsn: u64,
+    pub(crate) xact_id: Option<u32>,
 }
 
 impl Into<(u64, usize)> for RecordLocation {

@@ -254,6 +254,7 @@ impl MooncakeTable {
             lsn,
             pos: None,
             _row_identity: None,
+            xact_id: None,
         };
         let pos = self.mem_slice.delete(&record);
         record.pos = pos;
@@ -293,9 +294,10 @@ impl MooncakeTable {
         let lookup_key = (self.metadata.get_lookup_key)(&row);
         let mut record = RawDeletionRecord {
             lookup_key,
-            lsn: 0, // Updated at commit time
+            lsn: u64::MAX, // Updated at commit time
             pos: None,
             _row_identity: None,
+            xact_id: Some(xact_id),
         };
 
         let stream_state = self.get_or_create_stream_state(xact_id);
@@ -303,7 +305,7 @@ impl MooncakeTable {
 
         // This is fine since we will flush and remap to disk position on commit
         record.pos = pos;
-        stream_state.new_deletions.push(record);
+        self.next_snapshot_task.new_deletions.push(record);
     }
 
     pub fn abort_in_stream_batch(&mut self, xact_id: u32) {
@@ -352,6 +354,7 @@ impl MooncakeTable {
         if let Some(mut stream_state) = self.transaction_stream_states.remove(&xact_id) {
             let mem_slice = &mut stream_state.mem_slice;
             let snapshot_task = &mut self.next_snapshot_task;
+            let snapshot = &mut self.snapshot;
 
             // We update our delete records with the last lsn of the transaction
             // Note that in the stream case we dont have this until commit time
@@ -359,10 +362,19 @@ impl MooncakeTable {
                 deletion.lsn = lsn;
             }
 
-            // Now extend the snapshot task with the updated deletion records
-            snapshot_task
-                .new_deletions
-                .extend(stream_state.new_deletions);
+            // Patch deletion records for this transaction with the commit LSN
+            for deletion in snapshot_task.new_deletions.iter_mut() {
+                if deletion.xact_id == Some(xact_id) {
+                    deletion.lsn = lsn;
+                }
+            }
+            for deletion in snapshot.lock().unwrap().uncommitted_deletion_log.iter_mut() {
+                if let Some(deletion) = deletion {
+                    if deletion.xact_id == Some(xact_id) {
+                        deletion.lsn = lsn;
+                    }
+                }
+            }
 
             Ok(Self::inner_flush(
                 mem_slice,
@@ -575,6 +587,7 @@ impl MooncakeTable {
                 _lookup_key: deletion.lookup_key,
                 pos: pos.into(),
                 lsn: deletion.lsn,
+                xact_id: deletion.xact_id,
             };
         } else {
             let locations = snapshot.current_snapshot.indices.find_record(&deletion);
@@ -592,6 +605,7 @@ impl MooncakeTable {
                                 _lookup_key: deletion.lookup_key,
                                 pos: location.clone(),
                                 lsn: deletion.lsn,
+                                xact_id: deletion.xact_id,
                             };
                         }
                     }
@@ -607,6 +621,7 @@ impl MooncakeTable {
                                 _lookup_key: deletion.lookup_key,
                                 pos: location.clone(),
                                 lsn: deletion.lsn,
+                                xact_id: deletion.xact_id,
                             };
                         }
                     }
