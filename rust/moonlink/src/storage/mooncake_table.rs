@@ -1,4 +1,4 @@
-use super::index::index_util::{get_lookup_key, Index, MemIndex, MooncakeIndex};
+use super::index::{get_lookup_key, Index, MemIndex, MooncakeIndex};
 use crate::error::{Error, Result};
 use crate::row::MoonlinkRow;
 use crate::storage::data_batches::InMemoryBatch;
@@ -368,7 +368,8 @@ impl MooncakeTable {
                     deletion.lsn = lsn;
                 }
             }
-            for deletion in snapshot.lock().unwrap().uncommitted_deletion_log.iter_mut() {
+            let mut guard = snapshot.write().unwrap();
+            for deletion in guard.uncommitted_deletion_log.iter_mut() {
                 if let Some(deletion) = deletion {
                     if deletion.xact_id == Some(xact_id) {
                         deletion.lsn = lsn;
