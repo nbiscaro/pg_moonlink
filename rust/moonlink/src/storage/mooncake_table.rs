@@ -292,7 +292,7 @@ impl MooncakeTable {
 
     pub fn delete_in_stream_batch(&mut self, row: MoonlinkRow, xact_id: u32) {
         let lookup_key = (self.metadata.get_lookup_key)(&row);
-        let mut record = RawDeletionRecord {
+        let record = RawDeletionRecord {
             lookup_key,
             lsn: u64::MAX, // Updated at commit time
             pos: None,
@@ -302,10 +302,9 @@ impl MooncakeTable {
 
         let stream_state = self.get_or_create_stream_state(xact_id);
         let pos = stream_state.mem_slice.delete(&record);
-
-        // This is fine since we will flush and remap to disk position on commit
-        record.pos = pos;
-        self.next_snapshot_task.new_deletions.push(record);
+        if pos.is_none() {
+            self.next_snapshot_task.new_deletions.push(record);
+        }
     }
 
     pub fn abort_in_stream_batch(&mut self, xact_id: u32) {
