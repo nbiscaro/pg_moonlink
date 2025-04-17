@@ -292,7 +292,7 @@ impl MooncakeTable {
 
     pub fn delete_in_stream_batch(&mut self, row: MoonlinkRow, xact_id: u32) {
         let lookup_key = (self.metadata.get_lookup_key)(&row);
-        let record = RawDeletionRecord {
+        let mut record = RawDeletionRecord {
             lookup_key,
             lsn: u64::MAX, // Updated at commit time
             pos: None,
@@ -303,6 +303,12 @@ impl MooncakeTable {
         let stream_state = self.get_or_create_stream_state(xact_id);
         let pos = stream_state.mem_slice.delete(&record);
         if pos.is_none() {
+            // Edge‑case: txn deletes a row that’s still in the main mem_slice
+            if let Some(loc) = self.mem_slice.find_position(lookup_key) {
+                if let RecordLocation::MemoryBatch(batch_id, row_id) = loc {
+                    record.pos = Some((batch_id as u64, row_id));
+                }
+            }
             self.next_snapshot_task.new_deletions.push(record);
         }
     }
@@ -1614,6 +1620,80 @@ mod tests {
         assert_eq!(
             actual_ids, expected_ids,
             "Expected only rows with IDs 1 and 3 to be present (ID 2 was deleted)"
+        );
+
+        // Clean up
+        temp_dir.close().unwrap();
+
+        println!("Transaction stream flush test passed!");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_delete_from_main_mem_slice() -> Result<()> {
+        // Create a temporary directory for test data
+        let temp_dir = tempdir().unwrap();
+        let test_dir = temp_dir.path().join("test_txn_flush_dir");
+        create_dir_all(&test_dir).unwrap();
+        println!("Test directory: {:?}", test_dir);
+
+        // Create a schema for testing
+        let schema = Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("name", DataType::Utf8, true),
+            Field::new("age", DataType::Int32, false),
+        ]);
+
+        // Create a MooncakeTable
+        let mut table =
+            MooncakeTable::new(schema, "txn_flush_test".to_string(), 1, test_dir.clone());
+        // Add some records to the main mem_slice
+        let main_memslice_rows = vec![
+            MoonlinkRow::new(vec![
+                RowValue::Int32(8),
+                RowValue::ByteArray("Main-Row1".as_bytes().to_vec()),
+                RowValue::Int32(38),
+            ]),
+            MoonlinkRow::new(vec![
+                RowValue::Int32(9),
+                RowValue::ByteArray("Main-Row2".as_bytes().to_vec()),
+                RowValue::Int32(39),
+            ]),
+        ];
+
+        for row in main_memslice_rows {
+            table.append(row)?;
+        }
+        table.commit(4);
+
+        let row_to_delete = MoonlinkRow::new(vec![
+            RowValue::Int32(8),
+            RowValue::ByteArray("Main-Row1".as_bytes().to_vec()),
+            RowValue::Int32(38),
+        ]);
+
+        let xact_id_4 = 104;
+
+        println!("Deleting from main memslice in Transaction 4");
+        // Delete from main memslice within a transaction
+        table.delete_in_stream_batch(row_to_delete, xact_id_4);
+
+        println!("Flushing Transaction 4 data...");
+        let flush_handle = table.flush_transaction_stream(xact_id_4, 4)?;
+
+        // Wait for flush to complete and get the disk slice writer
+        let disk_slice = flush_handle.await.unwrap()?;
+
+        println!("Commit the flush");
+        // Commit the flush
+        table.commit_flush(disk_slice)?;
+
+        println!("Create the snapshot");
+        // Create snapshot to apply changes
+        let snapshot_handle = table.create_snapshot().unwrap();
+        assert!(
+            snapshot_handle.await.is_ok(),
+            "Initial snapshot creation failed"
         );
 
         // Clean up

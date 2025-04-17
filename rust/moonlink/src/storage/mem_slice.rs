@@ -75,6 +75,10 @@ impl MemSlice {
     pub fn get_commit_check_point(&self) -> RecordLocation {
         self.column_store.get_commit_check_point()
     }
+
+    pub fn find_position(&self, lookup_key: i64) -> Option<RecordLocation> {
+        return self.mem_index.get(&lookup_key).cloned();
+    }
 }
 
 #[cfg(test)]
