@@ -1,6 +1,6 @@
-pub use moonlink::Error;
+mod error;
 
-use moonlink::Result;
+use error::Result;
 use moonlink::TableEvent;
 use moonlink_connectors::{MoonlinkPostgresSource, PostgresSourceMetadata};
 use std::collections::HashMap;

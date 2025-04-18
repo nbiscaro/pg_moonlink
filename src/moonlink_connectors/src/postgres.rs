@@ -53,7 +53,7 @@ pub struct MoonlinkPostgresSource {
 }
 
 impl MoonlinkPostgresSource {
-    pub async fn new(metadata: PostgresSourceMetadata) -> Result<Self> {
+    pub async fn new(metadata: PostgresSourceMetadata) -> Result<Self, PostgresSourceError> {
         let mut config = Config::new();
         config
             .host(&metadata.host)
@@ -86,7 +86,7 @@ impl MoonlinkPostgresSource {
         &mut self,
         schema: &str,
         table: &str,
-    ) -> Result<mpsc::Sender<moonlink::TableEvent>> {
+    ) -> Result<mpsc::Sender<moonlink::TableEvent>, PostgresSourceError> {
         self.postgres_client
             .simple_query(&format!(
                 "ALTER PUBLICATION moonlink_pub ADD TABLE {}.{};",
