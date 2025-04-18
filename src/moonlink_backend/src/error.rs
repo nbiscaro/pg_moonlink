@@ -1,4 +1,4 @@
-use moonlink_connectors::pg_replicate::pipeline::sources::postgres::PostgresSourceError;
+use moonlink_connectors::PostgresSourceError;
 use std::result;
 use thiserror::Error;
 
