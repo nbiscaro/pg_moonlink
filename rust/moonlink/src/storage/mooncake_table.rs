@@ -304,6 +304,13 @@ impl MooncakeTable {
         let pos = stream_state.mem_slice.delete(&record);
         if pos.is_none() {
             // Edge‑case: txn deletes a row that’s still in the main mem_slice
+            // NOTE: There is still a remaining edge case that is not yet supported:
+            // In the event that we have two identical, rows A and B, with no primary key (using full row as
+            // identifier). We may have a situation where we delete A during some streaming
+            // transaction, and then delete A in a non-streaming transaction. In this case, we will
+            // delete A twice instead of deleting A then B. A potential solution is to have the
+            // main mem slilce delete from the top of the matches rows and the streamin transaction
+            // to delete from the bottom, but this needs a closer look.
             record.pos = self.mem_slice.find_non_deleted_position(&record);
             self.next_snapshot_task.new_deletions.push(record);
         }
