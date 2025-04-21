@@ -159,6 +159,17 @@ impl ColumnStoreBuffer {
             .delete_row(row_offset)
     }
 
+    pub fn is_deleted(&self, (batch_id, row_offset): (u64, usize)) -> bool {
+        let idx = self
+            .in_memory_batches
+            .binary_search_by_key(&batch_id, |x| x.id)
+            .unwrap();
+        self.in_memory_batches[idx]
+            .batch
+            .deletions
+            .is_deleted(row_offset)
+    }
+
     pub fn flush(&mut self) -> Vec<BatchEntry> {
         assert!(self.current_row_count == 0);
         let last = self.in_memory_batches.pop();

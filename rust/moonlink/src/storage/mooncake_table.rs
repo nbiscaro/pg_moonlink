@@ -304,11 +304,7 @@ impl MooncakeTable {
         let pos = stream_state.mem_slice.delete(&record);
         if pos.is_none() {
             // Edge‑case: txn deletes a row that’s still in the main mem_slice
-            if let Some(loc) = self.mem_slice.find_position(lookup_key) {
-                if let RecordLocation::MemoryBatch(batch_id, row_id) = loc {
-                    record.pos = Some((batch_id as u64, row_id));
-                }
-            }
+            record.pos = self.mem_slice.find_non_deleted_position(&record);
             self.next_snapshot_task.new_deletions.push(record);
         }
     }

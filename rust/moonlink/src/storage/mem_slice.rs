@@ -47,6 +47,22 @@ impl MemSlice {
         None
     }
 
+    /// Find the first non-deleted position for a given lookup key
+    pub fn find_non_deleted_position(&self, record: &RawDeletionRecord) -> Option<(u64, usize)> {
+        let locations = self.mem_index.find_record(&record)?;
+
+        for location in locations {
+            let location_tuple: (u64, usize) = location.clone().into();
+            let (batch_id, row_offset) = location_tuple;
+
+            if !self.column_store.is_deleted(location_tuple) {
+                return Some((batch_id, row_offset));
+            }
+        }
+
+        None
+    }
+
     pub fn append(
         &mut self,
         primary_key: i64,
@@ -74,10 +90,6 @@ impl MemSlice {
 
     pub fn get_commit_check_point(&self) -> RecordLocation {
         self.column_store.get_commit_check_point()
-    }
-
-    pub fn find_position(&self, lookup_key: i64) -> Option<RecordLocation> {
-        return self.mem_index.get(&lookup_key).cloned();
     }
 }
 
