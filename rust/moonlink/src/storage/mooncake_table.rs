@@ -101,6 +101,7 @@ pub struct SnapshotTask {
     new_mem_indices: Vec<Arc<MemIndex>>,
     new_lsn: u64,
     new_commit_point: Option<RecordLocation>,
+    flushed_xacts: HashMap<u32, u64>,
 }
 
 impl SnapshotTask {
@@ -113,6 +114,7 @@ impl SnapshotTask {
             new_mem_indices: Vec::new(),
             new_lsn: 0,
             new_commit_point: None,
+            flushed_xacts: HashMap::new(),
         }
     }
 
@@ -129,6 +131,7 @@ impl SnapshotTask {
         self.new_record_batches = take(&mut other.new_record_batches);
         self.new_rows = take(&mut other.new_rows);
         self.new_mem_indices = take(&mut other.new_mem_indices);
+        self.flushed_xacts = take(&mut other.flushed_xacts);
     }
 }
 pub struct SnapshotTableState {
@@ -303,7 +306,7 @@ impl MooncakeTable {
         let stream_state = self.get_or_create_stream_state(xact_id);
         let pos = stream_state.mem_slice.delete(&record);
         if pos.is_none() {
-            // Edge‑case: txn deletes a row that’s still in the main mem_slice
+            // Edge‑case: txn deletes a row that's still in the main mem_slice
             // NOTE: There is still a remaining edge case that is not yet supported:
             // In the event that we have two identical, rows A and B, with no primary key (using full row as
             // identifier). We may have a situation where we delete A during some streaming
@@ -361,8 +364,6 @@ impl MooncakeTable {
     ) -> Result<JoinHandle<Result<DiskSliceWriter>>> {
         if let Some(mut stream_state) = self.transaction_stream_states.remove(&xact_id) {
             let mem_slice = &mut stream_state.mem_slice;
-            let snapshot_task = &mut self.next_snapshot_task;
-            let snapshot = &mut self.snapshot;
 
             // We update our delete records with the last lsn of the transaction
             // Note that in the stream case we dont have this until commit time
@@ -370,20 +371,15 @@ impl MooncakeTable {
                 deletion.lsn = lsn;
             }
 
-            // Patch deletion records for this transaction with the commit LSN
+            let snapshot_task = &mut self.next_snapshot_task;
+
             for deletion in snapshot_task.new_deletions.iter_mut() {
                 if deletion.xact_id == Some(xact_id) {
                     deletion.lsn = lsn;
                 }
             }
-            let mut guard = snapshot.write().unwrap();
-            for deletion in guard.uncommitted_deletion_log.iter_mut() {
-                if let Some(deletion) = deletion {
-                    if deletion.xact_id == Some(xact_id) {
-                        deletion.lsn = lsn;
-                    }
-                }
-            }
+
+            snapshot_task.flushed_xacts.insert(xact_id, lsn);
 
             Ok(Self::inner_flush(
                 mem_slice,
@@ -669,6 +665,14 @@ impl MooncakeTable {
         next_snapshot_task: &mut SnapshotTask,
     ) {
         let mut new_commited_deletion = vec![];
+        // update uncommitted deletion log with flushed xact lsn's
+        for deletion in snapshot.uncommitted_deletion_log.iter_mut() {
+            if let Some(ref xact_id) = deletion.as_ref().unwrap().xact_id {
+                if let Some(lsn) = next_snapshot_task.flushed_xacts.get(xact_id) {
+                    deletion.as_mut().unwrap().lsn = *lsn;
+                }
+            }
+        }
         snapshot.uncommitted_deletion_log.retain_mut(|deletion| {
             if deletion.as_ref().unwrap().lsn <= next_snapshot_task.new_lsn {
                 new_commited_deletion.push(deletion.take().unwrap());
