@@ -127,6 +127,7 @@ impl SnapshotTableState {
                 _lookup_key: deletion.lookup_key,
                 pos: pos.into(),
                 lsn: deletion.lsn,
+                xact_id: deletion.xact_id,
             };
         } else {
             let locations = self.current_snapshot.indices.find_record(&deletion);
@@ -144,6 +145,7 @@ impl SnapshotTableState {
                                 _lookup_key: deletion.lookup_key,
                                 pos: location.clone(),
                                 lsn: deletion.lsn,
+                                xact_id: deletion.xact_id,
                             };
                         }
                     }
@@ -159,6 +161,7 @@ impl SnapshotTableState {
                                 _lookup_key: deletion.lookup_key,
                                 pos: location.clone(),
                                 lsn: deletion.lsn,
+                                xact_id: deletion.xact_id,
                             };
                         }
                     }
@@ -199,12 +202,27 @@ impl SnapshotTableState {
     fn process_deletion_log(&mut self, next_snapshot_task: &mut SnapshotTask) {
         let mut new_commited_deletion = vec![];
         self.uncommitted_deletion_log.retain_mut(|deletion| {
-            if deletion.as_ref().unwrap().lsn <= next_snapshot_task.new_lsn {
-                new_commited_deletion.push(deletion.take().unwrap());
-                false
-            } else {
-                true
+            let mut should_keep = true;
+
+            // First update LSN if it's from a flushed transaction
+            if let Some(xact_id) = deletion.as_ref().unwrap().xact_id {
+                if let Some(lsn) = next_snapshot_task.flushed_xacts.get(&xact_id) {
+                    deletion.as_mut().unwrap().lsn = *lsn;
+                }
+
+                // Check if this is from an aborted transaction
+                if next_snapshot_task.aborted_xacts.contains(&xact_id) {
+                    should_keep = false;
+                }
             }
+
+            // After potentially updating LSN, check if it's now committed
+            if should_keep && deletion.as_ref().unwrap().lsn <= next_snapshot_task.new_lsn {
+                new_commited_deletion.push(deletion.take().unwrap());
+                should_keep = false;
+            }
+
+            should_keep
         });
         for deletion in new_commited_deletion {
             Self::commit_deletion(self, deletion);

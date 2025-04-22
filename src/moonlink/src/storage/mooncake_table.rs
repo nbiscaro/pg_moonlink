@@ -7,7 +7,7 @@ mod snapshot;
 
 use super::index::{get_lookup_key, MemIndex, MooncakeIndex};
 use super::storage_utils::{RawDeletionRecord, RecordLocation};
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::row::MoonlinkRow;
 use arrow::record_batch::RecordBatch;
 use arrow_schema::Schema;
@@ -108,6 +108,8 @@ pub struct SnapshotTask {
     new_mem_indices: Vec<Arc<MemIndex>>,
     new_lsn: u64,
     new_commit_point: Option<RecordLocation>,
+    flushed_xacts: HashMap<u32, u64>,
+    aborted_xacts: Vec<u32>,
 }
 
 impl SnapshotTask {
@@ -120,11 +122,29 @@ impl SnapshotTask {
             new_mem_indices: Vec::new(),
             new_lsn: 0,
             new_commit_point: None,
+            flushed_xacts: HashMap::new(),
+            aborted_xacts: Vec::new(),
         }
     }
 
     pub fn should_create_snapshot(&self) -> bool {
         self.new_lsn > 0 || self.new_disk_slices.len() > 0
+    }
+}
+
+/// Used to track the state of a streamed transaction
+/// Holds the memslice and pending deletes
+struct TransactionStreamState {
+    mem_slice: MemSlice,
+    new_deletions: Vec<RawDeletionRecord>,
+}
+
+impl TransactionStreamState {
+    fn new(schema: Arc<Schema>, batch_size: usize) -> Self {
+        Self {
+            mem_slice: MemSlice::new(schema, batch_size),
+            new_deletions: Vec::new(),
+        }
     }
 }
 
@@ -147,9 +167,8 @@ pub struct MooncakeTable {
     snapshot: Arc<RwLock<SnapshotTableState>>,
     next_snapshot_task: SnapshotTask,
 
-    // UNDONE(BATCH_INSERT):
-    // a memslice per transaction?
-    _stream_write_mem_slices: HashMap<u64, MemSlice>,
+    // Stream state per transaction
+    transaction_stream_states: HashMap<u32, TransactionStreamState>,
 }
 
 impl MooncakeTable {
@@ -171,7 +190,7 @@ impl MooncakeTable {
             metadata: metadata.clone(),
             snapshot: Arc::new(RwLock::new(SnapshotTableState::new(metadata))),
             next_snapshot_task: SnapshotTask::new(),
-            _stream_write_mem_slices: HashMap::new(),
+            transaction_stream_states: HashMap::new(),
         };
 
         table
@@ -194,6 +213,7 @@ impl MooncakeTable {
             lsn,
             pos: None,
             _row_identity: None,
+            xact_id: None,
         };
         let pos = self.mem_slice.delete(&record);
         record.pos = pos;
@@ -209,47 +229,133 @@ impl MooncakeTable {
         self.mem_slice.get_num_rows() >= self.metadata.config.batch_size
     }
 
-    pub fn _append_in_stream_batch(&mut self, _row: MoonlinkRow, _xact_id: u64) -> Result<()> {
-        todo!("Implement append in stream batch");
+    fn get_or_create_stream_state(&mut self, xact_id: u32) -> &mut TransactionStreamState {
+        self.transaction_stream_states
+            .entry(xact_id)
+            .or_insert_with(|| {
+                TransactionStreamState::new(
+                    self.metadata.schema.clone(),
+                    self.metadata.config.batch_size,
+                )
+            })
     }
 
-    pub fn _delete_in_stream_batch(&mut self, _row: MoonlinkRow, _xact_id: u64) -> Result<()> {
-        todo!("Implement delete in stream batch");
+    pub fn append_in_stream_batch(&mut self, row: MoonlinkRow, xact_id: u32) -> Result<()> {
+        let lookup_key = (self.metadata.get_lookup_key)(&row);
+        let stream_state = self.get_or_create_stream_state(xact_id);
+
+        stream_state.mem_slice.append(lookup_key, &row)?;
+
+        Ok(())
     }
 
-    pub fn _commit_in_stream_batch(&mut self, _xact_id: u64) -> Result<()> {
-        todo!("Implement commit in stream batch");
-    }
+    pub fn delete_in_stream_batch(&mut self, row: MoonlinkRow, xact_id: u32) {
+        let lookup_key = (self.metadata.get_lookup_key)(&row);
+        let mut record = RawDeletionRecord {
+            lookup_key,
+            lsn: u64::MAX, // Updated at commit time
+            pos: None,
+            _row_identity: None,
+            xact_id: Some(xact_id),
+        };
 
-    pub fn _abort_in_stream_batch(&mut self, _xact_id: u64) -> Result<()> {
-        todo!("Implement abort in stream batch");
-    }
-
-    // UNDONE(BATCH_INSERT):
-    // flush uncommitted batches from big batch insert
-    pub fn flush(&mut self, lsn: u64) -> JoinHandle<Result<DiskSliceWriter>> {
-        // finalize the current batch
-        let (new_batch, batches, index) = self.mem_slice.drain().unwrap();
-        if let Some(batch) = new_batch {
-            self.next_snapshot_task.new_record_batches.push(batch);
-            self.next_snapshot_task.new_rows = vec![];
+        let stream_state = self.get_or_create_stream_state(xact_id);
+        let pos = stream_state.mem_slice.delete(&record);
+        if pos.is_none() {
+            // Edge‑case: txn deletes a row that's still in the main mem_slice
+            // NOTE: There is still a remaining edge case that is not yet supported:
+            // In the event that we have two identical, rows A and B, with no primary key (using full row as
+            // identifier). We may have a situation where we delete A during some streaming
+            // transaction, and then delete A in a non-streaming transaction. In this case, we will
+            // delete A twice instead of deleting A then B. A potential solution is to have the
+            // main mem slice delete from the top of the matches rows and the streamin transaction
+            // to delete from the bottom, but this needs a closer look.
+            record.pos = self.mem_slice.find_non_deleted_position(&record);
+            self.next_snapshot_task.new_deletions.push(record);
         }
-        let old_index = Arc::new(index);
-        self.next_snapshot_task
-            .new_mem_indices
-            .push(old_index.clone());
+    }
+
+    pub fn abort_in_stream_batch(&mut self, xact_id: u32) {
+        // Record abortion in snapshot task so we can remove any uncomitted deletions
+        self.next_snapshot_task.aborted_xacts.push(xact_id);
+        self.transaction_stream_states.remove(&xact_id);
+    }
+
+    fn inner_flush(
+        mem_slice: &mut MemSlice,
+        snapshot_task: &mut SnapshotTask,
+        metadata: &Arc<TableMetadata>,
+        lsn: u64,
+    ) -> JoinHandle<Result<DiskSliceWriter>> {
+        // Finalize the current batch (if needed)
+        let (new_batch, batches, index) = mem_slice.drain().unwrap();
+
+        if let Some(batch) = new_batch {
+            snapshot_task.new_record_batches.push(batch);
+            snapshot_task.new_rows.clear();
+        }
+
+        let index = Arc::new(index);
+        snapshot_task.new_mem_indices.push(index.clone());
+
         let mut disk_slice = DiskSliceWriter::new(
-            self.metadata.schema.clone(),
-            self.metadata.path.clone(),
+            metadata.schema.clone(),
+            metadata.path.clone(),
             batches,
             lsn,
-            old_index,
+            index,
         );
         // Spawn a task to build the disk slice asynchronously
         spawn(async move {
             disk_slice.write()?;
             Ok(disk_slice)
         })
+    }
+
+    pub fn flush_transaction_stream(
+        &mut self,
+        xact_id: u32,
+        lsn: u64,
+    ) -> Result<JoinHandle<Result<DiskSliceWriter>>> {
+        if let Some(mut stream_state) = self.transaction_stream_states.remove(&xact_id) {
+            let mem_slice = &mut stream_state.mem_slice;
+
+            // We update our delete records with the last lsn of the transaction
+            // Note that in the stream case we dont have this until commit time
+            for deletion in stream_state.new_deletions.iter_mut() {
+                deletion.lsn = lsn;
+            }
+
+            let snapshot_task = &mut self.next_snapshot_task;
+
+            for deletion in snapshot_task.new_deletions.iter_mut() {
+                if deletion.xact_id == Some(xact_id) {
+                    deletion.lsn = lsn;
+                }
+            }
+
+            snapshot_task.flushed_xacts.insert(xact_id, lsn);
+
+            Ok(Self::inner_flush(
+                mem_slice,
+                snapshot_task,
+                &self.metadata,
+                lsn,
+            ))
+        } else {
+            Err(Error::TransactionNotFound(xact_id))
+        }
+    }
+
+    // UNDONE(BATCH_INSERT):
+    // flush uncommitted batches from big batch insert
+    pub fn flush(&mut self, lsn: u64) -> JoinHandle<Result<DiskSliceWriter>> {
+        Self::inner_flush(
+            &mut self.mem_slice,
+            &mut self.next_snapshot_task,
+            &self.metadata,
+            lsn,
+        )
     }
 
     pub fn commit_flush(&mut self, disk_slice: DiskSliceWriter) -> Result<()> {

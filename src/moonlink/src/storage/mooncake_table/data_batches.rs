@@ -171,7 +171,6 @@ impl ColumnStoreBuffer {
             .is_deleted(row_offset)
     }
 
-    pub fn flush(&mut self) -> Vec<BatchEntry> {
     pub(super) fn drain(&mut self) -> Vec<BatchEntry> {
         assert!(self.current_row_count == 0);
         let last = self.in_memory_batches.pop();

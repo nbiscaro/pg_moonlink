@@ -134,7 +134,6 @@ impl BatchSink for Sink {
                     }
                 }
                 CdcEvent::Insert((table_id, table_row, xact_id)) => {
-                CdcEvent::Insert((table_id, table_row, _xact_id)) => {
                     if let Some(prev_id) = table_id_in_transaction {
                         assert!(
                             prev_id == table_id,
