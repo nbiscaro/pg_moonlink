@@ -1,9 +1,8 @@
 [workspace]
 members = [
-    "rust/moonlink",
-    "rust/moonlink_connectors",
-    "rust/pg_moonlink_test",
-    "rust/pg_mooncake_test_fn",
+    "src/moonlink",
+    "src/moonlink_connectors",
+    "src/moonlink_backend",
 ]
 resolver = "2"
 
@@ -14,15 +13,19 @@ edition = "2021"
 [workspace.dependencies]
 async-trait = "0.1"
 
-pg_replicate = { git = "https://github.com/Mooncake-Labs/pg_replicate", rev = "6185151c9746cece94fa2bb3792bbd536ac35b93" }
-tokio-postgres = { git = "ssh://git@github.com/Mooncake-Labs/rust-postgres.git", package = "tokio-postgres" }
-tokio.version = "1.38"
-arrow = "54.2.1"
+tokio-postgres = { git = "ssh://git@github.com/Mooncake-labs/rust-postgres.git"}
+arrow = "53.4.1"
 thiserror = "2.0.12"
-parquet = "54.2.1"
+parquet = "53.4.1"
 tempfile = "3.18.0"
-uuid = "1.15.1"
 futures = "0.3.31"
 multimap = "0.10.0"
-chrono = "0.4.40"
+chrono = "=0.4.39"
 num-traits = "0.2.19"
+postgres-replication = { git = "ssh://git@github.com/Mooncake-labs/rust-postgres.git" }
+tokio = { version = "1.38", features = ["rt-multi-thread", "macros"] }
+uuid = { version = "1.15.1", features = ["v4"] }
+arrow-array = "53.4.1"
+arrow-schema = "53.4.1"
+iceberg = "0.4.0"
+iceberg-catalog-memory = "0.4.0"

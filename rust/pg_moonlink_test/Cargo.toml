@@ -1,9 +1,0 @@
-[package]
-name = "pg_moonlink_test"
-version.workspace = true
-edition.workspace = true
-
-[dependencies]
-moonlink_connectors = { path = "../moonlink_connectors" }
-pg_replicate.workspace = true
-tokio.workspace = true
