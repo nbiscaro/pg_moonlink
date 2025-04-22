@@ -102,6 +102,7 @@ pub struct SnapshotTask {
     new_lsn: u64,
     new_commit_point: Option<RecordLocation>,
     flushed_xacts: HashMap<u32, u64>,
+    aborted_xacts: Vec<u32>,
 }
 
 impl SnapshotTask {
@@ -115,6 +116,7 @@ impl SnapshotTask {
             new_lsn: 0,
             new_commit_point: None,
             flushed_xacts: HashMap::new(),
+            aborted_xacts: Vec::new(),
         }
     }
 
@@ -132,6 +134,7 @@ impl SnapshotTask {
         self.new_rows = take(&mut other.new_rows);
         self.new_mem_indices = take(&mut other.new_mem_indices);
         self.flushed_xacts = take(&mut other.flushed_xacts);
+        self.aborted_xacts = take(&mut other.aborted_xacts);
     }
 }
 pub struct SnapshotTableState {
@@ -312,7 +315,7 @@ impl MooncakeTable {
             // identifier). We may have a situation where we delete A during some streaming
             // transaction, and then delete A in a non-streaming transaction. In this case, we will
             // delete A twice instead of deleting A then B. A potential solution is to have the
-            // main mem slilce delete from the top of the matches rows and the streamin transaction
+            // main mem slice delete from the top of the matches rows and the streamin transaction
             // to delete from the bottom, but this needs a closer look.
             record.pos = self.mem_slice.find_non_deleted_position(&record);
             self.next_snapshot_task.new_deletions.push(record);
@@ -320,7 +323,8 @@ impl MooncakeTable {
     }
 
     pub fn abort_in_stream_batch(&mut self, xact_id: u32) {
-        // Simply remove the transaction stream state
+        // Record abortion in snapshot task so we can remove any uncomitted deletions
+        self.next_snapshot_task.aborted_xacts.push(xact_id);
         self.transaction_stream_states.remove(&xact_id);
     }
 
@@ -665,22 +669,32 @@ impl MooncakeTable {
         next_snapshot_task: &mut SnapshotTask,
     ) {
         let mut new_commited_deletion = vec![];
-        // update uncommitted deletion log with flushed xact lsn's
-        for deletion in snapshot.uncommitted_deletion_log.iter_mut() {
-            if let Some(ref xact_id) = deletion.as_ref().unwrap().xact_id {
-                if let Some(lsn) = next_snapshot_task.flushed_xacts.get(xact_id) {
+
+        // Process all deletion operations in a single pass
+        snapshot.uncommitted_deletion_log.retain_mut(|deletion| {
+            let mut should_keep = true;
+
+            // First update LSN if it's from a flushed transaction
+            if let Some(xact_id) = deletion.as_ref().unwrap().xact_id {
+                if let Some(lsn) = next_snapshot_task.flushed_xacts.get(&xact_id) {
                     deletion.as_mut().unwrap().lsn = *lsn;
                 }
+
+                // Check if this is from an aborted transaction
+                if next_snapshot_task.aborted_xacts.contains(&xact_id) {
+                    should_keep = false;
+                }
             }
-        }
-        snapshot.uncommitted_deletion_log.retain_mut(|deletion| {
-            if deletion.as_ref().unwrap().lsn <= next_snapshot_task.new_lsn {
+
+            // After potentially updating LSN, check if it's now committed
+            if should_keep && deletion.as_ref().unwrap().lsn <= next_snapshot_task.new_lsn {
                 new_commited_deletion.push(deletion.take().unwrap());
-                false
-            } else {
-                true
+                should_keep = false;
             }
+
+            should_keep
         });
+
         for deletion in new_commited_deletion {
             Self::commit_deletion(snapshot, deletion);
         }
