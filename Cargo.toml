@@ -1,9 +1,5 @@
 [workspace]
-members = [
-    "src/moonlink",
-    "src/moonlink_connectors",
-    "src/moonlink_backend",
-]
+members = ["src/moonlink", "src/moonlink_connectors", "src/moonlink_backend"]
 resolver = "2"
 
 [workspace.package]
@@ -13,7 +9,7 @@ edition = "2021"
 [workspace.dependencies]
 async-trait = "0.1"
 
-tokio-postgres = { git = "ssh://git@github.com/Mooncake-labs/rust-postgres.git"}
+tokio-postgres = { git = "https://github.com/Mooncake-labs/rust-postgres.git" }
 arrow = "54.2.1"
 thiserror = "2.0.12"
 parquet = "54.2.1"
@@ -22,12 +18,12 @@ futures = "0.3.31"
 multimap = "0.10.0"
 chrono = "=0.4.39"
 num-traits = "0.2.19"
-postgres-replication = { git = "ssh://git@github.com/Mooncake-labs/rust-postgres.git" }
-tokio = { version = "1.38", features = ["rt-multi-thread", "macros", "sync", "time"] }
+postgres-replication = { git = "https://github.com/Mooncake-labs/rust-postgres.git" }
+tokio = { version = "1.38", features = ["rt-multi-thread", "macros"] }
 uuid = { version = "1.15.1", features = ["v4"] }
 arrow-array = "54.2.1"
 arrow-schema = "54.2.1"
 serde_json = { version = "1.0", features = ["std"] }
 
-iceberg = { git = "https://github.com/apache/iceberg-rust.git", rev = "53ceb2b5426f56efd1152a9daaa2fca25847b6ff"}
+iceberg = { git = "https://github.com/apache/iceberg-rust.git", rev = "53ceb2b5426f56efd1152a9daaa2fca25847b6ff" }
 iceberg-catalog-rest = { git = "https://github.com/apache/iceberg-rust.git", rev = "53ceb2b5426f56efd1152a9daaa2fca25847b6ff" }
