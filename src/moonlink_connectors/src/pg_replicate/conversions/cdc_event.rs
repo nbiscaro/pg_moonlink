@@ -2,9 +2,9 @@ use core::str;
 use std::{collections::HashMap, str::Utf8Error};
 
 use postgres_replication::protocol::{
-    BeginBody, CommitBody, DeleteBody, InsertBody, LogicalReplicationMessage, RelationBody,
-    ReplicationMessage, StreamAbortBody, StreamCommitBody, StreamStartBody, StreamStopBody,
-    TupleData, TypeBody, UpdateBody,
+    BeginBody, CommitBody, DeleteBody, InsertBody, LogicalReplicationMessage, PrimaryKeepAliveBody,
+    RelationBody, ReplicationMessage, StreamAbortBody, StreamCommitBody, StreamStartBody,
+    StreamStopBody, TupleData, TypeBody, UpdateBody,
 };
 use thiserror::Error;
 
@@ -185,9 +185,9 @@ impl CdcEventConverter {
                 }
                 _ => Err(CdcEventConversionError::UnknownReplicationMessage),
             },
-            ReplicationMessage::PrimaryKeepAlive(keep_alive) => Ok(CdcEvent::KeepAliveRequested {
-                reply: keep_alive.reply() == 1,
-            }),
+            ReplicationMessage::PrimaryKeepAlive(primary_keepalive_body) => {
+                Ok(CdcEvent::PrimaryKeepAlive(primary_keepalive_body))
+            }
             _ => Err(CdcEventConversionError::UnknownReplicationMessage),
         }
     }
@@ -202,7 +202,7 @@ pub enum CdcEvent {
     Delete((TableId, TableRow, Option<u32>)),
     Relation(RelationBody),
     Type(TypeBody),
-    KeepAliveRequested { reply: bool },
+    PrimaryKeepAlive(PrimaryKeepAliveBody),
     StreamStart(StreamStartBody),
     StreamStop(StreamStopBody),
     StreamCommit(StreamCommitBody),
@@ -217,7 +217,7 @@ impl BatchBoundary for CdcEvent {
                 | CdcEvent::StreamCommit(_)
                 | CdcEvent::StreamStop(_)
                 | CdcEvent::StreamAbort(_)
-                | CdcEvent::KeepAliveRequested { reply: _ }
+                | CdcEvent::PrimaryKeepAlive(_)
         )
     }
 }

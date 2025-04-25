@@ -173,7 +173,7 @@ impl BatchSink for Sink {
                 }
                 CdcEvent::Relation(relation_body) => println!("Relation {relation_body:?}"),
                 CdcEvent::Type(type_body) => println!("Type {type_body:?}"),
-                CdcEvent::KeepAliveRequested { .. } => {}
+                CdcEvent::PrimaryKeepAlive(primary_keepalive_body) => {}
                 CdcEvent::StreamStop(stream_stop_body) => {
                     println!("Stream stop {stream_stop_body:?}");
                 }

@@ -147,9 +147,12 @@ impl<Src: Source, Snk: BatchSink> BatchDataPipeline<Src, Snk> {
                     continue;
                 }
                 let event = event.map_err(CommonSourceError::CdcStream)?;
-                if let CdcEvent::KeepAliveRequested { reply } = event {
-                    send_status_update = reply;
-                };
+                match &event {
+                    CdcEvent::PrimaryKeepAlive(primary_keepalive_body) => {
+                        send_status_update = primary_keepalive_body.reply() == 1;
+                    }
+                    _ => {}
+                }
                 events.push(event);
             }
             let last_lsn = self
