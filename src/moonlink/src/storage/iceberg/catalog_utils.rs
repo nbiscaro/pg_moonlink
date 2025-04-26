@@ -8,8 +8,10 @@ use url::Url;
 #[derive(Debug, Clone)]
 pub enum CatalogInfo {
     /// Connection to a REST catalog server.
+    #[allow(unused)]
     Rest { uri: String },
     /// Local filesystem based catalog.
+    #[allow(unused)]
     FileSystem { warehouse_location: String },
 }
 
@@ -23,6 +25,7 @@ impl Default for CatalogInfo {
 }
 
 impl CatalogInfo {
+    #[allow(unused)]
     pub fn display(&self) -> String {
         match self {
             CatalogInfo::Rest { uri } => format!("REST catalog uri: {}", uri),
