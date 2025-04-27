@@ -3,9 +3,9 @@ use crate::row::MoonlinkRow;
 use crate::storage::DiskSliceWriter;
 use crate::storage::MooncakeTable;
 use tokio::sync::mpsc::{self, Receiver, Sender};
+use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio::time::{self, Duration};
-
 /// Event types that can be processed by the TableHandler
 #[derive(Debug)]
 pub enum TableEvent {
@@ -213,7 +213,8 @@ mod tests {
 
         // Create a TableHandler
         let table = MooncakeTable::new(schema, "test_table".to_string(), 1, path);
-        let read_state_manager = ReadStateManager::new(&table);
+        let (_, replication_rx) = watch::channel(0u64);
+        let read_state_manager = ReadStateManager::new(&table, replication_rx);
         let handler = TableHandler::new(table);
         let event_sender = handler.get_event_sender();
 
@@ -265,7 +266,8 @@ mod tests {
 
         // Create a TableHandler
         let table = MooncakeTable::new(schema, "test_table".to_string(), 1, path);
-        let read_state_manager = ReadStateManager::new(&table);
+        let (_, replication_rx) = watch::channel(0u64);
+        let read_state_manager = ReadStateManager::new(&table, replication_rx);
         let handler = TableHandler::new(table);
         let event_sender = handler.get_event_sender();
 
@@ -337,7 +339,8 @@ mod tests {
 
         // Create a TableHandler
         let table = MooncakeTable::new(schema, "test_table".to_string(), 1, path);
-        let read_state_manager = ReadStateManager::new(&table);
+        let (_, replication_rx) = watch::channel(0u64);
+        let read_state_manager = ReadStateManager::new(&table, replication_rx);
         let handler = TableHandler::new(table);
         let event_sender = handler.get_event_sender();
 
@@ -389,7 +392,8 @@ mod tests {
 
         // Create a TableHandler
         let table = MooncakeTable::new(schema, "test_table".to_string(), 1, path);
-        let read_state_manager = ReadStateManager::new(&table);
+        let (_, replication_rx) = watch::channel(0u64);
+        let read_state_manager = ReadStateManager::new(&table, replication_rx);
         let handler = TableHandler::new(table);
         let event_sender = handler.get_event_sender();
 
@@ -464,7 +468,8 @@ mod tests {
 
         // Create a TableHandler
         let table = MooncakeTable::new(schema, "test_table".to_string(), 1, path);
-        let read_state_manager = ReadStateManager::new(&table);
+        let (_, replication_rx) = watch::channel(0u64);
+        let read_state_manager = ReadStateManager::new(&table, replication_rx);
         let handler = TableHandler::new(table);
         let event_sender = handler.get_event_sender();
 
@@ -543,7 +548,8 @@ mod tests {
 
         // Create a TableHandler
         let table = MooncakeTable::new(schema, "test_table".to_string(), 1, path);
-        let read_state_manager = ReadStateManager::new(&table);
+        let (_, replication_rx) = watch::channel(0u64);
+        let read_state_manager = ReadStateManager::new(&table, replication_rx);
         let handler = TableHandler::new(table);
         let event_sender = handler.get_event_sender();
 

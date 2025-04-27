@@ -2,7 +2,7 @@ use crate::pg_replicate::{
     conversions::{cdc_event::CdcEvent, table_row::TableRow},
     pipeline::{
         sinks::{BatchSink, InfallibleSinkError},
-        PipelineResumptionState,
+        PipelineReplicationState, PipelineResumptionState,
     },
     table::{TableId, TableSchema},
 };
@@ -14,13 +14,16 @@ use moonlink::{MooncakeTable, TableEvent, TableHandler};
 use std::collections::{HashMap, HashSet};
 use std::fs::create_dir_all;
 use std::path::PathBuf;
+use std::sync::Arc;
 use tokio::sync::mpsc::Sender;
 use tokio_postgres::types::PgLsn;
+
 pub struct Sink {
     table_handlers: HashMap<TableId, TableHandler>,
     event_senders: HashMap<TableId, Sender<TableEvent>>,
     reader_notifier: Sender<ReadStateManager>,
     base_path: PathBuf,
+    replication_state: Arc<PipelineReplicationState>,
 }
 
 impl Sink {
@@ -31,6 +34,7 @@ impl Sink {
             event_senders,
             reader_notifier,
             base_path,
+            replication_state: PipelineReplicationState::new(),
         }
     }
 }
@@ -61,7 +65,8 @@ impl BatchSink for Sink {
                 table_id as u64,
                 table_path,
             );
-            let read_state_manager = ReadStateManager::new(&table);
+            let read_state_manager =
+                ReadStateManager::new(&table, self.replication_state.subscribe());
             let table_handler = TableHandler::new(table);
             self.event_senders
                 .insert(table_id, table_handler.get_event_sender());
@@ -173,7 +178,10 @@ impl BatchSink for Sink {
                 }
                 CdcEvent::Relation(relation_body) => println!("Relation {relation_body:?}"),
                 CdcEvent::Type(type_body) => println!("Type {type_body:?}"),
-                CdcEvent::PrimaryKeepAlive(primary_keepalive_body) => {}
+                CdcEvent::PrimaryKeepAlive(primary_keepalive_body) => {
+                    self.replication_state
+                        .mark(PgLsn::from(primary_keepalive_body.wal_end()));
+                }
                 CdcEvent::StreamStop(stream_stop_body) => {
                     println!("Stream stop {stream_stop_body:?}");
                 }
