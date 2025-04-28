@@ -184,6 +184,7 @@ mod tests {
     use crate::union_read::decode_read_state_for_testing;
     use crate::union_read::ReadStateManager;
     use arrow::datatypes::{DataType, Field, Schema};
+    use tokio::sync::watch;
 
     pub async fn check_read_snapshot(
         read_manager: &ReadStateManager,
