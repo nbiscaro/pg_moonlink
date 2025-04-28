@@ -34,7 +34,7 @@ pub struct PipelineReplicationState {
 }
 
 impl PipelineReplicationState {
-    /// Create a new clock initialised to LSN 0.
+    /// Create a new count initialised to LSN 0.
     pub fn new() -> Arc<Self> {
         let (tx, _rx) = watch::channel(0);
         Arc::new(Self {
@@ -43,7 +43,7 @@ impl PipelineReplicationState {
         })
     }
 
-    /// Advance the clock if `lsn` is newer.
+    /// Advance the count if `lsn` is newer.
     pub fn mark(&self, lsn: PgLsn) {
         let lsn_u64: u64 = lsn.into();
         if lsn_u64 > self.current.load(Ordering::Relaxed) {

@@ -3,7 +3,6 @@ use crate::row::MoonlinkRow;
 use crate::storage::DiskSliceWriter;
 use crate::storage::MooncakeTable;
 use tokio::sync::mpsc::{self, Receiver, Sender};
-use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio::time::{self, Duration};
 /// Event types that can be processed by the TableHandler
