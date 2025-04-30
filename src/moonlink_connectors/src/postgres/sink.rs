@@ -23,6 +23,7 @@ pub struct Sink {
     table_handlers: HashMap<TableId, TableHandler>,
     last_committed_lsn_per_table: HashMap<TableId, watch::Sender<u64>>,
     event_senders: HashMap<TableId, Sender<TableEvent>>,
+    transaction_tables: HashMap<u32, HashSet<TableId>>,
     reader_notifier: Sender<ReadStateManager>,
     base_path: PathBuf,
     replication_state: Arc<PipelineReplicationState>,
@@ -35,6 +36,7 @@ impl Sink {
             table_handlers: HashMap::new(),
             last_committed_lsn_per_table: HashMap::new(),
             event_senders,
+            transaction_tables: HashMap::new(),
             reader_notifier,
             base_path,
             replication_state: PipelineReplicationState::new(),
@@ -105,8 +107,10 @@ impl BatchSink for Sink {
     }
 
     async fn write_cdc_events(&mut self, events: Vec<CdcEvent>) -> Result<PgLsn, Self::Error> {
-        let mut tables_in_transaction: HashSet<u32> = HashSet::new();
         let mut lsn_in_transaction: Option<u64> = None;
+        // Track tables modified within this specific batch for non-streamed commits
+        let mut tables_in_batch: HashSet<TableId> = HashSet::new();
+
         for event in events {
             println!("Received CDC event: {:?}", event);
             match event {
@@ -117,8 +121,13 @@ impl BatchSink for Sink {
                     println!("Stream start {stream_start_body:?}");
                 }
                 CdcEvent::Commit(commit_body) => {
-                    for table_id in &tables_in_transaction {
-                        let event_sender = self.event_senders.get_mut(table_id).unwrap();
+                    // Non-streamed commit: affects tables modified within this batch.
+                    println!(
+                        "PostgresSink: Processing non-streamed Commit with LSN: {}",
+                        commit_body.commit_lsn()
+                    );
+                    for table_id in &tables_in_batch {
+                        let event_sender = self.event_senders.get(table_id).unwrap().clone();
                         event_sender
                             .send(TableEvent::Commit {
                                 lsn: commit_body.commit_lsn(),
@@ -131,66 +140,100 @@ impl BatchSink for Sink {
                             .send(commit_body.commit_lsn())
                             .unwrap();
                     }
-                    tables_in_transaction.clear();
+                    tables_in_batch.clear(); // Clear for the next potential non-streamed TX in the batch
                 }
                 CdcEvent::StreamCommit(stream_commit_body) => {
-                    for table_id in &tables_in_transaction {
-                        let event_sender = self.event_senders.get_mut(table_id).unwrap();
-                        event_sender
-                            .send(TableEvent::StreamCommit {
-                                lsn: stream_commit_body.commit_lsn(),
-                                xact_id: stream_commit_body.xid(),
-                            })
-                            .await
-                            .unwrap();
-                        self.last_committed_lsn_per_table
-                            .get_mut(table_id)
-                            .unwrap()
-                            .send(stream_commit_body.commit_lsn())
-                            .unwrap();
+                    // Note: Logic to populate self.transaction_tables moved to Insert/Update/Delete arms
+                    let xact_id = stream_commit_body.xid();
+                    if let Some(tables_in_txn) = self.transaction_tables.get(&xact_id) {
+                        for table_id in tables_in_txn {
+                            println!("PostgresSink: Sending TableEvent::StreamCommit for table_id={}, xact_id={}, lsn={}", 
+                                table_id, xact_id, stream_commit_body.commit_lsn());
+                            let event_sender = self.event_senders.get_mut(table_id).unwrap();
+                            event_sender
+                                .send(TableEvent::StreamCommit {
+                                    lsn: stream_commit_body.commit_lsn(),
+                                    xact_id,
+                                })
+                                .await
+                                .unwrap();
+                            self.last_committed_lsn_per_table
+                                .get_mut(table_id)
+                                .unwrap()
+                                .send(stream_commit_body.commit_lsn())
+                                .unwrap();
+                        }
                     }
+                    self.transaction_tables.remove(&xact_id);
                 }
-                CdcEvent::Insert((table_id, table_row, xact_id)) => {
-                    tables_in_transaction.insert(table_id);
+                CdcEvent::Insert((table_id, table_row, xact_id_opt)) => {
+                    // Track table for potential non-streamed commit within this batch
+                    tables_in_batch.insert(table_id);
+
                     let event_sender = self.event_senders.get_mut(&table_id).unwrap();
                     event_sender
                         .send(TableEvent::Append {
                             row: PostgresTableRow(table_row).into(),
-                            xact_id,
+                            xact_id: xact_id_opt,
                         })
                         .await
                         .unwrap();
+                    // Add to self.transaction_tables if this is part of a streamed transaction
+                    if let Some(xid) = xact_id_opt {
+                        self.transaction_tables
+                            .entry(xid)
+                            .or_default()
+                            .insert(table_id);
+                    }
                 }
-                CdcEvent::Update((table_id, old_table_row, new_table_row, xact_id)) => {
-                    tables_in_transaction.insert(table_id);
+                CdcEvent::Update((table_id, old_table_row, new_table_row, xact_id_opt)) => {
+                    // Track table for potential non-streamed commit within this batch
+                    tables_in_batch.insert(table_id);
+
                     let event_sender = self.event_senders.get_mut(&table_id).unwrap();
                     event_sender
                         .send(TableEvent::Delete {
                             row: PostgresTableRow(old_table_row.unwrap()).into(),
                             lsn: (lsn_in_transaction.unwrap()),
-                            xact_id,
+                            xact_id: xact_id_opt,
                         })
                         .await
                         .unwrap();
                     event_sender
                         .send(TableEvent::Append {
                             row: PostgresTableRow(new_table_row).into(),
-                            xact_id,
+                            xact_id: xact_id_opt,
                         })
                         .await
                         .unwrap();
+                    // Add to self.transaction_tables if this is part of a streamed transaction
+                    if let Some(xid) = xact_id_opt {
+                        self.transaction_tables
+                            .entry(xid)
+                            .or_default()
+                            .insert(table_id);
+                    }
                 }
-                CdcEvent::Delete((table_id, table_row, xact_id)) => {
-                    tables_in_transaction.insert(table_id);
+                CdcEvent::Delete((table_id, table_row, xact_id_opt)) => {
+                    // Track table for potential non-streamed commit within this batch
+                    tables_in_batch.insert(table_id);
+
                     let event_sender = self.event_senders.get_mut(&table_id).unwrap();
                     event_sender
                         .send(TableEvent::Delete {
                             row: PostgresTableRow(table_row).into(),
                             lsn: (lsn_in_transaction.unwrap()),
-                            xact_id,
+                            xact_id: xact_id_opt,
                         })
                         .await
                         .unwrap();
+                    // Add to self.transaction_tables if this is part of a streamed transaction
+                    if let Some(xid) = xact_id_opt {
+                        self.transaction_tables
+                            .entry(xid)
+                            .or_default()
+                            .insert(table_id);
+                    }
                 }
                 CdcEvent::Relation(relation_body) => println!("Relation {relation_body:?}"),
                 CdcEvent::Type(type_body) => println!("Type {type_body:?}"),
@@ -202,15 +245,24 @@ impl BatchSink for Sink {
                     println!("Stream stop {stream_stop_body:?}");
                 }
                 CdcEvent::StreamAbort(stream_abort_body) => {
-                    for table_id in &tables_in_transaction {
-                        let event_sender = self.event_senders.get_mut(table_id).unwrap();
-                        event_sender
-                            .send(TableEvent::StreamAbort {
-                                xact_id: stream_abort_body.xid(),
-                            })
-                            .await
-                            .unwrap();
+                    let xact_id = stream_abort_body.xid();
+                    // Get the tables involved *before* removing the entry
+                    if let Some(tables_in_txn) = self.transaction_tables.get(&xact_id) {
+                        // Collect table IDs to avoid borrowing issues while sending
+                        let table_ids_to_abort: Vec<TableId> =
+                            tables_in_txn.iter().cloned().collect();
+
+                        for table_id in tables_in_txn {
+                            // Send abort event - clone sender to avoid borrow issues
+                            let event_sender = self.event_senders.get(table_id).unwrap().clone();
+                            event_sender
+                                .send(TableEvent::StreamAbort { xact_id })
+                                .await
+                                .unwrap();
+                        }
                     }
+                    // Now remove the transaction entry
+                    self.transaction_tables.remove(&xact_id);
                 }
             }
         }

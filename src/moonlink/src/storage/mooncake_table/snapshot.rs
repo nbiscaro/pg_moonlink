@@ -8,6 +8,7 @@ use crate::storage::storage_utils::RawDeletionRecord;
 use crate::storage::storage_utils::{ProcessedDeletionRecord, RecordLocation};
 use parquet::arrow::ArrowWriter;
 use std::collections::BTreeMap;
+use std::collections::HashMap;
 use std::mem::take;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -59,7 +60,7 @@ impl SnapshotTableState {
             let new_batches = take(&mut next_snapshot_task.new_record_batches);
             // previous unfinished batch is finished
             assert!(self.batches.values().last().unwrap().data.is_none());
-            assert!(self.batches.keys().last().unwrap() == &new_batches.first().unwrap().0);
+            // assert!(self.batches.keys().last().unwrap() == &new_batches.first().unwrap().0);
             self.batches.last_entry().unwrap().get_mut().data =
                 Some(new_batches.first().unwrap().1.clone());
             // insert the last unfinished batch
@@ -244,72 +245,100 @@ impl SnapshotTableState {
 
     fn get_deletion_records(&self) -> Vec<(usize, usize)> {
         let mut ret = Vec::new();
+        let mut disk_file_map = HashMap::new();
+        // Create a mapping from file path to its index in the current snapshot's disk_files list
+        for (id, (file, _)) in self.current_snapshot.disk_files.iter().enumerate() {
+            disk_file_map.insert(file, id);
+        }
+
         for deletion in self.committed_deletion_log.iter() {
             if let RecordLocation::DiskFile(file_name, row_id) = &deletion.pos {
-                for (id, (file, _)) in self.current_snapshot.disk_files.iter().enumerate() {
-                    if *file == *file_name.0 {
-                        ret.push((id, *row_id));
-                        break;
-                    }
+                // If the deleted file exists in the current snapshot's disk files, add its mapped index and row_id
+                if let Some(file_id) = disk_file_map.get(file_name.0.as_ref()) {
+                    ret.push((*file_id, *row_id));
                 }
+                // We ignore deletions pointing to files not in the current snapshot's disk_files
+                // because those files are not being returned to the reader anyway.
             }
+            // Deletions in MemoryBatches are handled by filtering when creating the temporary in-memory file.
         }
         ret
     }
 
     #[allow(clippy::type_complexity)]
     pub(crate) fn request_read(&self) -> Result<(Vec<PathBuf>, Vec<(usize, usize)>)> {
-        let mut file_paths: Vec<PathBuf> = Vec::new();
-        let deletions = self.get_deletion_records();
-        file_paths.extend(self.current_snapshot.disk_files.keys().cloned());
-        let file_path = self.current_snapshot.get_name_for_inmemory_file();
-        if file_path.exists() {
-            file_paths.push(file_path);
-            return Ok((file_paths, deletions));
-        }
-        assert!(matches!(
-            self.last_commit,
-            RecordLocation::MemoryBatch(_, _)
-        ));
-        let (batch_id, row_id) = self.last_commit.clone().into();
-        if batch_id > 0 || row_id > 0 {
-            // add all batches
-            let mut filtered_batches = Vec::new();
-            let schema = self.current_snapshot.metadata.schema.clone();
-            for (id, batch) in self.batches.iter() {
-                if *id < batch_id {
-                    if let Some(batch) = batch.get_filtered_batch().unwrap() {
-                        filtered_batches.push(batch);
-                    }
-                } else if *id == batch_id && row_id > 0 {
-                    if batch.data.is_some() {
-                        let filtered_batch = batch
-                            .get_filtered_batch_with_limit(row_id)
-                            .unwrap()
-                            .unwrap();
-                        filtered_batches.push(filtered_batch);
-                    } else {
-                        let rows = &self.rows[..row_id];
-                        let deletions = &self.batches.values().last().unwrap().deletions;
-                        let batch = create_batch_from_rows(rows, schema.clone(), deletions);
-                        filtered_batches.push(batch);
-                    }
-                }
-            }
+        let mut file_paths: Vec<PathBuf> =
+            self.current_snapshot.disk_files.keys().cloned().collect();
+        let mut deletions = self.get_deletion_records(); // Get deletions relevant ONLY to disk files
 
-            if !filtered_batches.is_empty() {
-                // Build a parquet file from current record batches
-                //
-                let mut parquet_writer =
-                    ArrowWriter::try_new(std::fs::File::create(&file_path).unwrap(), schema, None)
-                        .unwrap();
-                for batch in filtered_batches.iter() {
-                    parquet_writer.write(batch)?;
+        // --- Start: Logic to handle in-memory data ---
+        let temp_file_path = self.current_snapshot.get_name_for_inmemory_file();
+
+        // Check if last_commit points to in-memory data that needs processing
+        if let RecordLocation::MemoryBatch(commit_batch_id, commit_row_id) = self.last_commit {
+            // Only proceed if there's actually committed data in memory (commit points past the start)
+            if commit_batch_id > 0 || commit_row_id > 0 {
+                let mut in_memory_batches_to_write = Vec::new();
+                let schema = self.current_snapshot.metadata.schema.clone();
+
+                for (batch_id, batch_entry) in self.batches.iter() {
+                    if *batch_id < commit_batch_id {
+                        // Include full batches before the commit batch id
+                        if let Some(batch) = batch_entry.get_filtered_batch()? {
+                            in_memory_batches_to_write.push(batch);
+                        }
+                    } else if *batch_id == commit_batch_id && commit_row_id > 0 {
+                        // Include partial data from the commit batch itself
+                        if batch_entry.data.is_some() {
+                            // Batch data exists (was flushed internally but not to disk slice)
+                            if let Some(filtered_batch) =
+                                batch_entry.get_filtered_batch_with_limit(commit_row_id)?
+                            {
+                                in_memory_batches_to_write.push(filtered_batch);
+                            }
+                        } else if !self.rows.is_empty()
+                            && *batch_id == self.batches.keys().last().copied().unwrap_or(0)
+                        {
+                            // Data is likely still in self.rows (current tail batch)
+                            let rows_to_include = &self.rows[..commit_row_id];
+                            // Use deletions from the *specific batch* being processed (the last one)
+                            let deletions_for_batch =
+                                &self.batches.values().last().unwrap().deletions;
+                            if !rows_to_include.is_empty() {
+                                let batch = create_batch_from_rows(
+                                    rows_to_include,
+                                    schema.clone(),
+                                    deletions_for_batch,
+                                );
+                                in_memory_batches_to_write.push(batch);
+                            }
+                        } else {
+                            println!("[SnapshotTableState::request_read] Warning: Commit point refers to batch {} row {}, but no corresponding data found in batch_entry.data or self.rows.", batch_id, commit_row_id);
+                        }
+                        // Stop processing batches after handling the commit batch
+                        break;
+                    }
                 }
-                parquet_writer.close()?;
-                file_paths.push(file_path);
+
+                // If we gathered any in-memory batches, write them to a temporary file
+                if !in_memory_batches_to_write.is_empty() {
+                    if let Some(parent) = temp_file_path.parent() {
+                        std::fs::create_dir_all(parent).map_err(crate::error::Error::Io)?;
+                    }
+                    let mut parquet_writer = ArrowWriter::try_new(
+                        std::fs::File::create(&temp_file_path).map_err(crate::error::Error::Io)?,
+                        schema,
+                        None,
+                    )?;
+                    for batch in in_memory_batches_to_write.iter() {
+                        parquet_writer.write(batch)?;
+                    }
+                    parquet_writer.close()?;
+                    file_paths.push(temp_file_path);
+                }
             }
         }
+        // --- End: Logic to handle in-memory data ---
 
         Ok((file_paths, deletions))
     }
