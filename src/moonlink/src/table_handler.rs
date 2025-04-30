@@ -66,7 +66,6 @@ impl TableHandler {
     /// Main event processing loop
     async fn event_loop(mut event_receiver: Receiver<TableEvent>, mut table: MooncakeTable) {
         let mut snapshot_handle: Option<JoinHandle<u64>> = None;
-        let mut flush_handle: Option<JoinHandle<Result<DiskSliceWriter>>> = None;
         let mut periodic_snapshot_interval = time::interval(Duration::from_millis(500));
 
         // Process events until the receiver is closed or a Shutdown event is received
@@ -94,18 +93,15 @@ impl TableHandler {
                         TableEvent::Commit { lsn } => {
                             table.commit(lsn);
                             if table.should_flush() {
-                                flush_handle = Some(table.flush(lsn));
+                                if let Err(e) = table.flush(lsn).await {
+                                    println!("Flush failed in Commit: {}", e);
+                                }
                             }
                         }
 
                         TableEvent::StreamCommit { lsn, xact_id } => {
-                            match table.flush_transaction_stream(xact_id, lsn) {
-                                Ok(writer) => {
-                                    flush_handle = Some(writer);
-                                }
-                                Err(e) => {
-                                    println!("Stream commit failed: {}", e);
-                                }
+                            if let Err(e) = table.flush_transaction_stream(xact_id, lsn).await {
+                                println!("Stream commit flush failed: {}", e);
                             }
                         }
 
@@ -113,7 +109,9 @@ impl TableHandler {
                             table.abort_in_stream_batch(xact_id);
                         }
                         TableEvent::Flush { lsn } => {
-                            flush_handle = Some(table.flush(lsn));
+                            if let Err(e) = table.flush(lsn).await {
+                                println!("Explicit Flush failed: {}", e);
+                            }
                         }
                         TableEvent::_Shutdown => {
                             println!("Shutting down table handler");
@@ -138,25 +136,6 @@ impl TableHandler {
                     }
                 } => {
                     snapshot_handle = None;
-                }
-                // wait for the flush to complete
-                Some(writer) = async {
-                    if let Some(handle) = &mut flush_handle {
-                        match handle.await {
-                            Ok(writer) => {
-                                Some(writer)
-                            }
-                            Err(e) => {
-                                println!("Flush task was cancelled: {}", e);
-                                None
-                            }
-                        }
-                    } else {
-                        futures::future::pending::<Option<_>>().await
-                    }
-                } => {
-                    table.commit_flush(writer.unwrap()).unwrap();
-                    flush_handle = None;
                 }
                 // Periodic snapshot based on time
                 _ = periodic_snapshot_interval.tick() => {
