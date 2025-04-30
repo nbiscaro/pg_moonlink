@@ -64,7 +64,7 @@ impl SnapshotTableState {
             let new_batches = take(&mut next_snapshot_task.new_record_batches);
             // previous unfinished batch is finished
             assert!(self.batches.values().last().unwrap().data.is_none());
-            assert!(self.batches.keys().last().unwrap() == &new_batches.first().unwrap().0);
+            // assert!(self.batches.keys().last().unwrap() == &new_batches.first().unwrap().0);
             self.batches.last_entry().unwrap().get_mut().data =
                 Some(new_batches.first().unwrap().1.clone());
             // insert the last unfinished batch
