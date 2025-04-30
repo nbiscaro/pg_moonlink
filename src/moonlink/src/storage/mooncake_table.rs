@@ -308,12 +308,12 @@ impl MooncakeTable {
         self.transaction_stream_states.remove(&xact_id);
     }
 
-    fn inner_flush(
+    async fn inner_flush(
         mem_slice: &mut MemSlice,
         snapshot_task: &mut SnapshotTask,
         metadata: &Arc<TableMetadata>,
         lsn: u64,
-    ) -> JoinHandle<Result<DiskSliceWriter>> {
+    ) -> Result<DiskSliceWriter> {
         // Finalize the current batch (if needed)
         let (new_batch, batches, index) = mem_slice.drain().unwrap();
 
@@ -332,18 +332,12 @@ impl MooncakeTable {
             lsn,
             index,
         );
-        // Spawn a task to build the disk slice asynchronously
-        spawn(async move {
-            disk_slice.write()?;
-            Ok(disk_slice)
-        })
+        // TODO(nbiscaro): Find longer term solution that allows aysnc write
+        disk_slice.write()?;
+        Ok(disk_slice)
     }
 
-    pub(crate) fn flush_transaction_stream(
-        &mut self,
-        xact_id: u32,
-        lsn: u64,
-    ) -> Result<JoinHandle<Result<DiskSliceWriter>>> {
+    pub async fn flush_transaction_stream(&mut self, xact_id: u32, lsn: u64) -> Result<()> {
         if let Some(mut stream_state) = self.transaction_stream_states.remove(&xact_id) {
             let mem_slice = &mut stream_state.mem_slice;
 
@@ -365,12 +359,10 @@ impl MooncakeTable {
 
             snapshot_task.flushed_xacts.insert(xact_id, lsn);
 
-            Ok(Self::inner_flush(
-                mem_slice,
-                snapshot_task,
-                &self.metadata,
-                lsn,
-            ))
+            let disk_slice =
+                Self::inner_flush(mem_slice, snapshot_task, &self.metadata, lsn).await?;
+            self.next_snapshot_task.new_disk_slices.push(disk_slice);
+            Ok(())
         } else {
             Err(Error::TransactionNotFound(xact_id))
         }
@@ -378,16 +370,15 @@ impl MooncakeTable {
 
     // UNDONE(BATCH_INSERT):
     // flush uncommitted batches from big batch insert
-    pub(crate) fn flush(&mut self, lsn: u64) -> JoinHandle<Result<DiskSliceWriter>> {
-        Self::inner_flush(
+    pub async fn flush(&mut self, lsn: u64) -> Result<()> {
+        // Call inner_flush directly and await
+        let disk_slice = Self::inner_flush(
             &mut self.mem_slice,
             &mut self.next_snapshot_task,
             &self.metadata,
             lsn,
         )
-    }
-
-    pub(crate) fn commit_flush(&mut self, disk_slice: DiskSliceWriter) -> Result<()> {
+        .await?;
         self.next_snapshot_task.new_disk_slices.push(disk_slice);
         Ok(())
     }
