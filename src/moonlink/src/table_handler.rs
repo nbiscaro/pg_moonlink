@@ -1,6 +1,4 @@
-use crate::error::Result;
 use crate::row::MoonlinkRow;
-use crate::storage::DiskSliceWriter;
 use crate::storage::MooncakeTable;
 use tokio::sync::mpsc::{self, Receiver, Sender};
 use tokio::task::JoinHandle;

@@ -17,7 +17,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::mpsc::Sender;
 use tokio::sync::watch;
-use tokio_postgres::{types::PgLsn, Transaction};
+use tokio_postgres::types::PgLsn;
 
 #[derive(Default)]
 struct TransactionState {
