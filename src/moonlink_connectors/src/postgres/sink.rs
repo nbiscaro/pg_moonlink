@@ -17,12 +17,20 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::mpsc::Sender;
 use tokio::sync::watch;
-use tokio_postgres::types::PgLsn;
+use tokio_postgres::{types::PgLsn, Transaction};
+
+#[derive(Default)]
+struct TransactionState {
+    final_lsn: u64,
+    touched_tables: HashSet<TableId>,
+}
 
 pub struct Sink {
     table_handlers: HashMap<TableId, TableHandler>,
     last_committed_lsn_per_table: HashMap<TableId, watch::Sender<u64>>,
     event_senders: HashMap<TableId, Sender<TableEvent>>,
+    streaming_transactions_state: HashMap<u32, TransactionState>,
+    transaction_state: TransactionState,
     reader_notifier: Sender<ReadStateManager>,
     base_path: PathBuf,
     replication_state: Arc<PipelineReplicationState>,
@@ -35,6 +43,11 @@ impl Sink {
             table_handlers: HashMap::new(),
             last_committed_lsn_per_table: HashMap::new(),
             event_senders,
+            streaming_transactions_state: HashMap::new(),
+            transaction_state: TransactionState {
+                final_lsn: 0,
+                touched_tables: HashSet::new(),
+            },
             reader_notifier,
             base_path,
             replication_state: PipelineReplicationState::new(),
@@ -105,19 +118,17 @@ impl BatchSink for Sink {
     }
 
     async fn write_cdc_events(&mut self, events: Vec<CdcEvent>) -> Result<PgLsn, Self::Error> {
-        let mut tables_in_transaction: HashSet<u32> = HashSet::new();
-        let mut lsn_in_transaction: Option<u64> = None;
         for event in events {
             println!("Received CDC event: {:?}", event);
             match event {
                 CdcEvent::Begin(begin_body) => {
-                    lsn_in_transaction = Some(begin_body.final_lsn());
+                    self.transaction_state.final_lsn = begin_body.final_lsn();
                 }
                 CdcEvent::StreamStart(stream_start_body) => {
                     println!("Stream start {stream_start_body:?}");
                 }
                 CdcEvent::Commit(commit_body) => {
-                    for table_id in &tables_in_transaction {
+                    for table_id in &self.transaction_state.touched_tables {
                         let event_sender = self.event_senders.get_mut(table_id).unwrap();
                         event_sender
                             .send(TableEvent::Commit {
@@ -131,27 +142,30 @@ impl BatchSink for Sink {
                             .send(commit_body.commit_lsn())
                             .unwrap();
                     }
-                    tables_in_transaction.clear();
+                    self.transaction_state.touched_tables.clear();
                 }
                 CdcEvent::StreamCommit(stream_commit_body) => {
-                    for table_id in &tables_in_transaction {
-                        let event_sender = self.event_senders.get_mut(table_id).unwrap();
-                        event_sender
-                            .send(TableEvent::StreamCommit {
-                                lsn: stream_commit_body.commit_lsn(),
-                                xact_id: stream_commit_body.xid(),
-                            })
-                            .await
-                            .unwrap();
-                        self.last_committed_lsn_per_table
-                            .get_mut(table_id)
-                            .unwrap()
-                            .send(stream_commit_body.commit_lsn())
-                            .unwrap();
+                    let xact_id = stream_commit_body.xid();
+                    if let Some(tables_in_txn) = self.streaming_transactions_state.get(&xact_id) {
+                        for table_id in &tables_in_txn.touched_tables {
+                            let event_sender = self.event_senders.get_mut(table_id).unwrap();
+                            event_sender
+                                .send(TableEvent::StreamCommit {
+                                    lsn: stream_commit_body.commit_lsn(),
+                                    xact_id,
+                                })
+                                .await
+                                .unwrap();
+                            self.last_committed_lsn_per_table
+                                .get_mut(table_id)
+                                .unwrap()
+                                .send(stream_commit_body.commit_lsn())
+                                .unwrap();
+                        }
                     }
+                    self.streaming_transactions_state.remove(&xact_id);
                 }
                 CdcEvent::Insert((table_id, table_row, xact_id)) => {
-                    tables_in_transaction.insert(table_id);
                     let event_sender = self.event_senders.get_mut(&table_id).unwrap();
                     event_sender
                         .send(TableEvent::Append {
@@ -160,14 +174,37 @@ impl BatchSink for Sink {
                         })
                         .await
                         .unwrap();
+                    if let Some(xid) = xact_id {
+                        self.streaming_transactions_state
+                            .entry(xid)
+                            .or_default()
+                            .touched_tables
+                            .insert(table_id);
+                    } else {
+                        self.transaction_state.touched_tables.insert(table_id);
+                    }
                 }
                 CdcEvent::Update((table_id, old_table_row, new_table_row, xact_id)) => {
-                    tables_in_transaction.insert(table_id);
+                    let final_lsn = if let Some(xid) = xact_id {
+                        self.streaming_transactions_state
+                            .entry(xid)
+                            .or_default()
+                            .touched_tables
+                            .insert(table_id);
+                        self.streaming_transactions_state
+                            .get(&xid)
+                            .unwrap()
+                            .final_lsn
+                    } else {
+                        self.transaction_state.touched_tables.insert(table_id);
+                        self.transaction_state.final_lsn
+                    };
+
                     let event_sender = self.event_senders.get_mut(&table_id).unwrap();
                     event_sender
                         .send(TableEvent::Delete {
                             row: PostgresTableRow(old_table_row.unwrap()).into(),
-                            lsn: (lsn_in_transaction.unwrap()),
+                            lsn: final_lsn,
                             xact_id,
                         })
                         .await
@@ -181,12 +218,26 @@ impl BatchSink for Sink {
                         .unwrap();
                 }
                 CdcEvent::Delete((table_id, table_row, xact_id)) => {
-                    tables_in_transaction.insert(table_id);
+                    let final_lsn = if let Some(xid) = xact_id {
+                        self.streaming_transactions_state
+                            .entry(xid)
+                            .or_default()
+                            .touched_tables
+                            .insert(table_id);
+                        self.streaming_transactions_state
+                            .get(&xid)
+                            .unwrap()
+                            .final_lsn
+                    } else {
+                        self.transaction_state.touched_tables.insert(table_id);
+                        self.transaction_state.final_lsn
+                    };
+
                     let event_sender = self.event_senders.get_mut(&table_id).unwrap();
                     event_sender
                         .send(TableEvent::Delete {
                             row: PostgresTableRow(table_row).into(),
-                            lsn: (lsn_in_transaction.unwrap()),
+                            lsn: final_lsn,
                             xact_id,
                         })
                         .await
@@ -202,15 +253,17 @@ impl BatchSink for Sink {
                     println!("Stream stop {stream_stop_body:?}");
                 }
                 CdcEvent::StreamAbort(stream_abort_body) => {
-                    for table_id in &tables_in_transaction {
-                        let event_sender = self.event_senders.get_mut(table_id).unwrap();
-                        event_sender
-                            .send(TableEvent::StreamAbort {
-                                xact_id: stream_abort_body.xid(),
-                            })
-                            .await
-                            .unwrap();
+                    let xact_id = stream_abort_body.xid();
+                    if let Some(tables_in_txn) = self.streaming_transactions_state.get(&xact_id) {
+                        for table_id in &tables_in_txn.touched_tables {
+                            let event_sender = self.event_senders.get_mut(table_id).unwrap();
+                            event_sender
+                                .send(TableEvent::StreamAbort { xact_id })
+                                .await
+                                .unwrap();
+                        }
                     }
+                    self.streaming_transactions_state.remove(&xact_id);
                 }
             }
         }
