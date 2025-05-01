@@ -119,13 +119,13 @@ impl BatchSink for Sink {
 
     async fn write_cdc_events(&mut self, events: Vec<CdcEvent>) -> Result<PgLsn, Self::Error> {
         for event in events {
-            println!("Received CDC event: {:?}", event);
+
             match event {
                 CdcEvent::Begin(begin_body) => {
                     self.transaction_state.final_lsn = begin_body.final_lsn();
                 }
                 CdcEvent::StreamStart(stream_start_body) => {
-                    println!("Stream start {stream_start_body:?}");
+
                 }
                 CdcEvent::Commit(commit_body) => {
                     for table_id in &self.transaction_state.touched_tables {
@@ -250,7 +250,7 @@ impl BatchSink for Sink {
                         .mark(PgLsn::from(primary_keepalive_body.wal_end()));
                 }
                 CdcEvent::StreamStop(stream_stop_body) => {
-                    println!("Stream stop {stream_stop_body:?}");
+
                 }
                 CdcEvent::StreamAbort(stream_abort_body) => {
                     let xact_id = stream_abort_body.xid();
@@ -271,12 +271,12 @@ impl BatchSink for Sink {
     }
 
     async fn table_copied(&mut self, table_id: TableId) -> Result<(), Self::Error> {
-        println!("table {table_id} copied");
+
         Ok(())
     }
 
     async fn truncate_table(&mut self, table_id: TableId) -> Result<(), Self::Error> {
-        println!("table {table_id} truncated");
+
         Ok(())
     }
 }

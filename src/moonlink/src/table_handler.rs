@@ -79,7 +79,7 @@ impl TableHandler {
                             };
 
                             if let Err(e) = result {
-                                println!("Failed to append row: {}", e);
+
                             }
                         }
                         TableEvent::Delete { row, lsn, xact_id } => {
@@ -92,14 +92,14 @@ impl TableHandler {
                             table.commit(lsn);
                             if table.should_flush() {
                                 if let Err(e) = table.flush(lsn).await {
-                                    println!("Flush failed in Commit: {}", e);
+
                                 }
                             }
                         }
 
                         TableEvent::StreamCommit { lsn, xact_id } => {
                             if let Err(e) = table.flush_transaction_stream(xact_id, lsn).await {
-                                println!("Stream commit flush failed: {}", e);
+
                             }
                         }
 
@@ -108,11 +108,11 @@ impl TableHandler {
                         }
                         TableEvent::Flush { lsn } => {
                             if let Err(e) = table.flush(lsn).await {
-                                println!("Explicit Flush failed: {}", e);
+
                             }
                         }
                         TableEvent::_Shutdown => {
-                            println!("Shutting down table handler");
+
                             break;
                         }
                     }
@@ -125,7 +125,7 @@ impl TableHandler {
                                 table.notify_snapshot_reader(lsn);
                             }
                             Err(e) => {
-                                println!("Snapshot task was cancelled: {}", e);
+
                             }
                         }
                         Some(())
@@ -139,13 +139,13 @@ impl TableHandler {
                 _ = periodic_snapshot_interval.tick() => {
                     // Only create a periodic snapshot if there isn't already one in progress
                     if snapshot_handle.is_none() {
-                        println!("Creating periodic snapshot");
+
                         snapshot_handle = table.create_snapshot();
                     }
                 }
                 // If all senders have been dropped, exit the loop
                 else => {
-                    println!("All event senders have been dropped, shutting down table handler");
+
                     break;
                 }
             }
@@ -231,8 +231,6 @@ mod tests {
         if let Some(handle) = handler._event_handle {
             handle.await.unwrap();
         }
-
-        println!("All table handler tests passed!");
     }
 
     #[tokio::test]
@@ -306,8 +304,6 @@ mod tests {
         if let Some(handle) = handler._event_handle {
             handle.await.unwrap();
         }
-
-        println!("All table handler flush tests passed!");
     }
 
     #[tokio::test]

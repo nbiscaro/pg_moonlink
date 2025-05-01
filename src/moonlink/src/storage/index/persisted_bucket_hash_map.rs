@@ -596,14 +596,14 @@ mod tests {
             .set_files(files)
             .set_directory(tempfile::tempdir().unwrap().into_path());
         let index = builder.build_from_flush(vec);
-        println!("{:?}", index);
-        println!("{:?}", index.search(&1));
-        println!("{:?}", index.search(&2));
+
+
+
 
         let file_id_remap = vec![0; index.files.len()];
         for block in index.index_blocks.iter() {
             for (hash, seg_idx, row_idx) in block.iter(&index, &file_id_remap) {
-                println!("{} {} {}", hash, seg_idx, row_idx);
+
             }
         }
     }

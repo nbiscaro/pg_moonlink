@@ -81,7 +81,7 @@ mod tests {
         });
 
         client.simple_query("DROP TABLE IF EXISTS test; CREATE TABLE test (id bigint PRIMARY KEY, name VARCHAR(255));").await.unwrap();
-        println!("created table");
+
         service
             .create_table("test", "public.test", uri)
             .await

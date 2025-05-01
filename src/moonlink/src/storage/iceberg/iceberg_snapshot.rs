@@ -290,7 +290,7 @@ mod tests {
             let tables = catalog.list_tables(&namespace).await?;
             for table in tables {
                 catalog.drop_table(&table).await.ok();
-                println!("Deleted table: {:?} in namespace {:?}", table, namespace);
+
             }
         }
 
@@ -301,7 +301,7 @@ mod tests {
         let namespaces = catalog.list_namespaces(/*parent=*/ None).await?;
         for namespace in namespaces {
             catalog.drop_namespace(&namespace).await.ok();
-            println!("Deleted namespace: {:?}", namespace);
+
         }
 
         Ok(())

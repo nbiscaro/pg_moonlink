@@ -16,7 +16,7 @@ pub struct ReadState {
 
 impl Drop for ReadState {
     fn drop(&mut self) {
-        println!("Dropping files: {:?}", self.associated_files);
+
         for file in self.associated_files.iter() {
             std::fs::remove_file(file).unwrap();
         }

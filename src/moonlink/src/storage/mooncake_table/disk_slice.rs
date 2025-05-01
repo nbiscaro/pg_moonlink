@@ -233,17 +233,17 @@ mod tests {
         disk_slice.write()?;
         // Verify files were created
         assert!(!disk_slice.output_files().is_empty());
-        println!("Files: {:?}", disk_slice.output_files());
+
 
         // Read the files and verify the data
         for (file, _rows) in disk_slice.output_files() {
             let file = File::open(file).map_err(Error::Io)?;
             let builder = ParquetRecordBatchReaderBuilder::try_new(file).unwrap();
-            println!("Converted arrow schema is: {}", builder.schema());
+
 
             let mut reader = builder.build().unwrap();
             let record_batch = reader.next().unwrap().unwrap();
-            println!("{:?}", record_batch);
+
         }
         // Clean up temporary directory
         temp_dir.close().map_err(Error::Io)?;
@@ -329,7 +329,7 @@ mod tests {
 
         // Verify files were created
         assert!(!disk_slice.output_files().is_empty());
-        println!("Files created: {:?}", disk_slice.output_files());
+
 
         // Get the remapped index and verify it
         let new_index = disk_slice.take_index().unwrap();

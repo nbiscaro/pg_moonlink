@@ -266,7 +266,7 @@ mod tests {
         buffer.finalize_current_batch()?;
 
         let batches = buffer.drain();
-        println!("batches: {:?}", batches);
+
         Ok(())
     }
 }
