@@ -441,7 +441,7 @@ impl ReplicationClient {
                             "pg_class".to_string(),
                         ))?;
 
-                if !(replica_identity == "d" || replica_identity == "f") {
+                if !(replica_identity == "f") {
                     return Err(ReplicationClientError::ReplicaIdentityNotSupported(
                         replica_identity.to_string(),
                     ));
