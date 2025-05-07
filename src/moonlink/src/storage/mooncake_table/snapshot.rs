@@ -245,46 +245,48 @@ impl SnapshotTableState {
         self.committed_deletion_log.push(deletion);
     }
 
-    /// Commit a few uncommitted valid deletion logs, with lsn <= new_lsn.
-    fn process_deletion_log(&mut self, next_snapshot_task: &mut SnapshotTask) {
-        let mut deletion_to_commit = vec![];
-        self.uncommitted_deletion_log.retain_mut(|deletion| {
-            let mut should_keep = true;
+    fn process_deletion_log(&mut self, task: &mut SnapshotTask) {
+        self.advance_pending_deletions(task);
+        self.apply_new_deletions(task);
+    }
 
-            // First update LSN if it's from a flushed transaction
-            if let Some(xact_id) = deletion.as_ref().unwrap().xact_id {
-                if let Some(lsn) = next_snapshot_task.flushed_xacts.get(&xact_id) {
-                    deletion.as_mut().unwrap().lsn = *lsn;
+    /// Update, commit, or re-queue previously seen deletions.
+    fn advance_pending_deletions(&mut self, task: &SnapshotTask) {
+        let mut still_uncommitted = Vec::new();
+
+        for mut entry in take(&mut self.uncommitted_deletion_log) {
+            let mut deletion = entry.take().unwrap();
+
+            // refresh LSN if the xact was flushed
+            // TODO(nbiscaro): We will likely end up moving this logic to strema commit.
+            if let Some(xid) = deletion.xact_id {
+                if let Some(lsn) = task.flushed_xacts.get(&xid) {
+                    deletion.lsn = *lsn;
                 }
-
-                // Check if this is from an aborted transaction
-                if next_snapshot_task.aborted_xacts.contains(&xact_id) {
-                    should_keep = false;
+                if task.aborted_xacts.contains(&xid) {
+                    continue; // drop aborted txns
                 }
             }
 
-            // After potentially updating LSN, check if it's now committed
-            if should_keep && deletion.as_ref().unwrap().lsn <= next_snapshot_task.new_lsn {
-                deletion_to_commit.push(deletion.take().unwrap());
-                should_keep = false;
+            if deletion.lsn <= task.new_lsn {
+                Self::commit_deletion(self, deletion);
+            } else {
+                still_uncommitted.push(Some(deletion));
             }
-
-            should_keep
-        });
-        for deletion in deletion_to_commit.into_iter() {
-            self.commit_deletion(deletion);
         }
 
-        // Move committed deletions (lsn <= new_lsn) to committed deletion log
-        // add raw deletion records, use index to find position and add to deletion buffer
-        let new_deletions = take(&mut next_snapshot_task.new_deletions);
-        // apply deletion records to deletion vectors
-        for deletion in new_deletions {
-            let processed_deletion = self.process_delete_record(deletion);
-            if processed_deletion.lsn <= next_snapshot_task.new_lsn {
-                self.commit_deletion(processed_deletion);
+        self.uncommitted_deletion_log = still_uncommitted;
+    }
+
+    /// Convert raw deletions discovered by the snapshot task and either commit
+    /// them or defer until their LSN becomes visible.
+    fn apply_new_deletions(&mut self, task: &mut SnapshotTask) {
+        for raw in take(&mut task.new_deletions) {
+            let processed = Self::process_delete_record(self, raw);
+            if processed.lsn <= task.new_lsn {
+                Self::commit_deletion(self, processed);
             } else {
-                self.uncommitted_deletion_log.push(Some(processed_deletion));
+                self.uncommitted_deletion_log.push(Some(processed));
             }
         }
     }
