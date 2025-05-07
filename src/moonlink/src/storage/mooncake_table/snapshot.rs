@@ -53,77 +53,95 @@ impl SnapshotTableState {
         }
     }
 
-    /// Return current snapshot's version.
-    pub(super) fn update_snapshot(&mut self, mut next_snapshot_task: SnapshotTask) -> u64 {
-        let batch_size = self.current_snapshot.metadata.config.batch_size;
-        if !next_snapshot_task.new_mem_indices.is_empty() {
-            let new_mem_indices = take(&mut next_snapshot_task.new_mem_indices);
-            for mem_index in new_mem_indices {
-                self.current_snapshot.indices.insert_memory_index(mem_index);
-            }
+    pub(super) fn update_snapshot(&mut self, mut task: SnapshotTask) -> u64 {
+        self.merge_mem_indices(&mut task);
+        self.finalize_batches(&mut task);
+        self.integrate_disk_slices(&mut task);
+
+        self.rows = take(&mut task.new_rows);
+        Self::process_deletion_log(self, &mut task);
+
+        if task.new_lsn != 0 {
+            self.current_snapshot.snapshot_version = task.new_lsn;
         }
-        if !next_snapshot_task.new_record_batches.is_empty() {
-            let new_batches = take(&mut next_snapshot_task.new_record_batches);
-            // previous unfinished batch is finished
-            assert!(self.batches.values().last().unwrap().data.is_none());
-            // assert!(self.batches.keys().last().unwrap() == &new_batches.first().unwrap().0);
-            self.batches.last_entry().unwrap().get_mut().data =
-                Some(new_batches.first().unwrap().1.clone());
-            // insert the last unfinished batch
-            let last_batch_id = new_batches.last().unwrap().0 + 1;
-            self.batches
-                .insert(last_batch_id, InMemoryBatch::new(batch_size));
-            // copy the rest of the batches
-            self.batches
-                .extend(new_batches.iter().skip(1).map(|(id, batch)| {
-                    (
-                        *id,
-                        InMemoryBatch {
-                            data: Some(batch.clone()),
-                            deletions: BatchDeletionVector::new(batch.num_rows()),
-                        },
-                    )
-                }));
+        if let Some(cp) = task.new_commit_point {
+            self.last_commit = cp;
         }
-        if !next_snapshot_task.new_disk_slices.is_empty() {
-            let mut new_disk_slices = take(&mut next_snapshot_task.new_disk_slices);
-            for slice in new_disk_slices.iter_mut() {
-                self.current_snapshot.disk_files.extend(
-                    slice.output_files().iter().map(|(file, row_count)| {
-                        (file.clone(), BatchDeletionVector::new(*row_count))
-                    }),
-                );
-                let write_lsn = slice.lsn();
-                let pos = self
-                    .committed_deletion_log
-                    .partition_point(|deletion| deletion.lsn <= write_lsn);
-                for entry in self.committed_deletion_log.iter_mut().skip(pos) {
-                    slice.remap_deletion_if_needed(entry);
-                }
-                for entry in self.uncommitted_deletion_log.iter_mut().flatten() {
-                    slice.remap_deletion_if_needed(entry);
-                }
-                self.current_snapshot
-                    .indices
-                    .insert_file_index(slice.take_index().unwrap());
-                self.current_snapshot
-                    .indices
-                    .delete_memory_index(slice.old_index());
-                slice.input_batches().iter().for_each(|batch| {
-                    self.batches.remove(&batch.id);
-                });
-            }
-        }
-        self.rows = take(&mut next_snapshot_task.new_rows);
-        self.process_deletion_log(&mut next_snapshot_task);
-        if next_snapshot_task.new_lsn != 0 {
-            self.current_snapshot.snapshot_version = next_snapshot_task.new_lsn;
-        }
-        if next_snapshot_task.new_commit_point.is_some() {
-            self.last_commit = next_snapshot_task.new_commit_point.unwrap();
-        }
-        // TODO(hjiang): now all committed changes are sync-ed to current snapshot, sync the snapshot to iceberg table as well.
+
         self.current_snapshot.snapshot_version
+    }
+
+    fn merge_mem_indices(&mut self, task: &mut SnapshotTask) {
+        for idx in take(&mut task.new_mem_indices) {
+            self.current_snapshot.indices.insert_memory_index(idx);
+        }
+    }
+
+    fn finalize_batches(&mut self, task: &mut SnapshotTask) {
+        if task.new_record_batches.is_empty() {
+            return;
+        }
+
+        let incoming = take(&mut task.new_record_batches);
+        // close previously‐open batch
+        assert!(self.batches.values().last().unwrap().data.is_none());
+        self.batches.last_entry().unwrap().get_mut().data = Some(incoming[0].1.clone());
+
+        // start a fresh empty batch after the newest data
+        let batch_size = self.current_snapshot.metadata.config.batch_size;
+        let next_id = incoming.last().unwrap().0 + 1;
+        self.batches.insert(next_id, InMemoryBatch::new(batch_size));
+
+        // add completed batches
+        self.batches
+            .extend(incoming.into_iter().skip(1).map(|(id, rb)| {
+                (
+                    id,
+                    InMemoryBatch {
+                        data: Some(rb.clone()),
+                        deletions: BatchDeletionVector::new(rb.num_rows()),
+                    },
+                )
+            }));
+    }
+
+    fn integrate_disk_slices(&mut self, task: &mut SnapshotTask) {
+        for mut slice in take(&mut task.new_disk_slices) {
+            // register new files
+            self.current_snapshot.disk_files.extend(
+                slice
+                    .output_files()
+                    .iter()
+                    .map(|(f, rows)| (f.clone(), BatchDeletionVector::new(*rows))),
+            );
+
+            // remap deletions written *after* this slice’s LSN
+            let write_lsn = slice.lsn();
+            let cut = self
+                .committed_deletion_log
+                .partition_point(|d| d.lsn <= write_lsn);
+
+            self.committed_deletion_log[cut..]
+                .iter_mut()
+                .for_each(|d| slice.remap_deletion_if_needed(d));
+
+            self.uncommitted_deletion_log
+                .iter_mut()
+                .flatten()
+                .for_each(|d| slice.remap_deletion_if_needed(d));
+
+            // swap indices and drop in-memory batches that were flushed
+            self.current_snapshot
+                .indices
+                .insert_file_index(slice.take_index().unwrap());
+            self.current_snapshot
+                .indices
+                .delete_memory_index(slice.old_index());
+
+            slice.input_batches().iter().for_each(|b| {
+                self.batches.remove(&b.id);
+            });
+        }
     }
 
     fn process_delete_record(&mut self, deletion: RawDeletionRecord) -> ProcessedDeletionRecord {
