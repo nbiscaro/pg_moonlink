@@ -4,6 +4,7 @@ use super::{Snapshot, SnapshotTask, TableMetadata};
 use crate::error::Result;
 use crate::storage::index::Index;
 use crate::storage::mooncake_table::shared_array::SharedRowBufferSnapshot;
+use crate::storage::mooncake_table::MoonlinkRow;
 use crate::storage::storage_utils::RawDeletionRecord;
 use crate::storage::storage_utils::{ProcessedDeletionRecord, RecordLocation};
 use parquet::arrow::ArrowWriter;
@@ -126,98 +127,91 @@ impl SnapshotTableState {
     }
 
     fn process_delete_record(&mut self, deletion: RawDeletionRecord) -> ProcessedDeletionRecord {
+        // Fast-path: The row we are deleting was in the mem slice so we already have the position
         if let Some(pos) = deletion.pos {
-            ProcessedDeletionRecord {
-                _lookup_key: deletion.lookup_key,
-                pos: pos.into(),
-                lsn: deletion.lsn,
-                xact_id: deletion.xact_id,
+            return Self::build_processed_deletion(deletion, pos.into());
+        }
+
+        // Locate all candidate positions for this record that have **not** yet been deleted.
+        let mut candidates: Vec<RecordLocation> = self
+            .current_snapshot
+            .indices
+            .find_record(&deletion)
+            .expect("record not found in indices")
+            .into_iter()
+            .filter(|loc| !self.is_deleted(loc))
+            .collect();
+
+        match candidates.len() {
+            0 => panic!("can't find deletion record"),
+            1 => Self::build_processed_deletion(deletion, candidates.pop().unwrap()),
+            _ => {
+                // Multiple candidates → disambiguate via full row identity comparison.
+                let identity = deletion
+                    .row_identity
+                    .as_ref()
+                    .expect("row_identity required when multiple matches");
+
+                let pos = candidates
+                    .into_iter()
+                    .find(|loc| self.matches_identity(loc, identity))
+                    .expect("can't find valid record to delete");
+
+                Self::build_processed_deletion(deletion, pos)
             }
-        } else {
-            let locations = self.current_snapshot.indices.find_record(&deletion);
-            let mut locations_not_deleted = Vec::new();
-            for location in locations.unwrap().into_iter() {
-                match &location {
-                    RecordLocation::MemoryBatch(batch_id, row_id) => {
-                        if !self
-                            .batches
-                            .get_mut(batch_id)
-                            .unwrap()
-                            .deletions
-                            .is_deleted(*row_id)
-                        {
-                            locations_not_deleted.push(location);
-                        }
-                    }
-                    RecordLocation::DiskFile(file_name, row_id) => {
-                        if !self
-                            .current_snapshot
-                            .disk_files
-                            .get_mut(file_name.0.as_ref())
-                            .unwrap()
-                            .is_deleted(*row_id)
-                        {
-                            locations_not_deleted.push(location);
-                        }
-                    }
-                }
+        }
+    }
+
+    #[inline]
+    fn build_processed_deletion(
+        deletion: RawDeletionRecord,
+        pos: RecordLocation,
+    ) -> ProcessedDeletionRecord {
+        ProcessedDeletionRecord {
+            _lookup_key: deletion.lookup_key,
+            pos,
+            lsn: deletion.lsn,
+            xact_id: deletion.xact_id,
+        }
+    }
+
+    /// Returns `true` if the location has already been marked deleted.
+    fn is_deleted(&mut self, loc: &RecordLocation) -> bool {
+        match loc {
+            RecordLocation::MemoryBatch(batch_id, row_id) => self
+                .batches
+                .get_mut(batch_id)
+                .expect("missing batch")
+                .deletions
+                .is_deleted(*row_id),
+
+            RecordLocation::DiskFile(file_name, row_id) => self
+                .current_snapshot
+                .disk_files
+                .get_mut(file_name.0.as_ref())
+                .expect("missing disk file")
+                .is_deleted(*row_id),
+        }
+    }
+
+    /// Verifies that `loc` matches the provided `identity`.
+    fn matches_identity(&self, loc: &RecordLocation, identity: &MoonlinkRow) -> bool {
+        match loc {
+            RecordLocation::MemoryBatch(batch_id, row_id) => {
+                let batch = self.batches.get(batch_id).expect("missing batch");
+                identity.equals_record_batch_at_offset(
+                    batch.data.as_ref().expect("batch missing data"),
+                    *row_id,
+                    &self.current_snapshot.metadata.identity,
+                )
             }
-            if locations_not_deleted.is_empty() {
-                panic!("can't find deletion record");
-            } else if locations_not_deleted.len() > 1 {
-                assert!(deletion.row_identity.is_some());
-                for location in locations_not_deleted.into_iter() {
-                    match &location {
-                        RecordLocation::MemoryBatch(batch_id, row_id) => {
-                            let batch = self.batches.get_mut(batch_id).unwrap();
-                            if deletion
-                                .row_identity
-                                .as_ref()
-                                .unwrap()
-                                .equals_record_batch_at_offset(
-                                    batch.data.as_ref().unwrap(),
-                                    *row_id,
-                                    &self.current_snapshot.metadata.identity,
-                                )
-                            {
-                                return ProcessedDeletionRecord {
-                                    _lookup_key: deletion.lookup_key,
-                                    pos: location,
-                                    lsn: deletion.lsn,
-                                    xact_id: deletion.xact_id,
-                                };
-                            }
-                        }
-                        RecordLocation::DiskFile(file_name, row_id) => {
-                            let name = file_name.0.to_string_lossy().to_string();
-                            if deletion
-                                .row_identity
-                                .as_ref()
-                                .unwrap()
-                                .equals_parquet_at_offset(
-                                    &name,
-                                    *row_id,
-                                    &self.current_snapshot.metadata.identity,
-                                )
-                            {
-                                return ProcessedDeletionRecord {
-                                    _lookup_key: deletion.lookup_key,
-                                    pos: location,
-                                    lsn: deletion.lsn,
-                                    xact_id: deletion.xact_id,
-                                };
-                            }
-                        }
-                    }
-                }
-                panic!("can't find valid record to delete");
-            } else {
-                ProcessedDeletionRecord {
-                    _lookup_key: deletion.lookup_key,
-                    pos: locations_not_deleted.first().unwrap().clone(),
-                    lsn: deletion.lsn,
-                    xact_id: deletion.xact_id,
-                }
+            RecordLocation::DiskFile(file_name, row_id) => {
+                let name = file_name.0.to_string_lossy();
+                identity.equals_parquet_at_offset(
+                    &name,
+                    *row_id,
+                    &self.current_snapshot.metadata.identity,
+                )
             }
         }
     }
