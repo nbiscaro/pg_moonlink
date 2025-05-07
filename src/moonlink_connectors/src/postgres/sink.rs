@@ -119,147 +119,152 @@ impl BatchSink for Sink {
 
     async fn write_cdc_events(&mut self, events: Vec<CdcEvent>) -> Result<PgLsn, Self::Error> {
         for event in events {
-            match event {
-                CdcEvent::Begin(begin_body) => {
-                    self.transaction_state.final_lsn = begin_body.final_lsn();
+            self.write_cdc_event(event).await?;
+        }
+        Ok(PgLsn::from(0))
+    }
+
+    async fn write_cdc_event(&mut self, event: CdcEvent) -> Result<PgLsn, Self::Error> {
+        match event {
+            CdcEvent::Begin(begin_body) => {
+                self.transaction_state.final_lsn = begin_body.final_lsn();
+            }
+            CdcEvent::StreamStart(_stream_start_body) => {}
+            CdcEvent::Commit(commit_body) => {
+                for table_id in &self.transaction_state.touched_tables {
+                    let event_sender = self.event_senders.get_mut(table_id).unwrap();
+                    event_sender
+                        .send(TableEvent::Commit {
+                            lsn: commit_body.commit_lsn(),
+                        })
+                        .await
+                        .unwrap();
+                    self.last_committed_lsn_per_table
+                        .get_mut(table_id)
+                        .unwrap()
+                        .send(commit_body.commit_lsn())
+                        .unwrap();
                 }
-                CdcEvent::StreamStart(_stream_start_body) => {}
-                CdcEvent::Commit(commit_body) => {
-                    for table_id in &self.transaction_state.touched_tables {
+                self.transaction_state.touched_tables.clear();
+            }
+            CdcEvent::StreamCommit(stream_commit_body) => {
+                let xact_id = stream_commit_body.xid();
+                if let Some(tables_in_txn) = self.streaming_transactions_state.get(&xact_id) {
+                    for table_id in &tables_in_txn.touched_tables {
                         let event_sender = self.event_senders.get_mut(table_id).unwrap();
                         event_sender
-                            .send(TableEvent::Commit {
-                                lsn: commit_body.commit_lsn(),
+                            .send(TableEvent::StreamCommit {
+                                lsn: stream_commit_body.commit_lsn(),
+                                xact_id,
                             })
                             .await
                             .unwrap();
                         self.last_committed_lsn_per_table
                             .get_mut(table_id)
                             .unwrap()
-                            .send(commit_body.commit_lsn())
+                            .send(stream_commit_body.commit_lsn())
                             .unwrap();
                     }
-                    self.transaction_state.touched_tables.clear();
                 }
-                CdcEvent::StreamCommit(stream_commit_body) => {
-                    let xact_id = stream_commit_body.xid();
-                    if let Some(tables_in_txn) = self.streaming_transactions_state.get(&xact_id) {
-                        for table_id in &tables_in_txn.touched_tables {
-                            let event_sender = self.event_senders.get_mut(table_id).unwrap();
-                            event_sender
-                                .send(TableEvent::StreamCommit {
-                                    lsn: stream_commit_body.commit_lsn(),
-                                    xact_id,
-                                })
-                                .await
-                                .unwrap();
-                            self.last_committed_lsn_per_table
-                                .get_mut(table_id)
-                                .unwrap()
-                                .send(stream_commit_body.commit_lsn())
-                                .unwrap();
-                        }
-                    }
-                    self.streaming_transactions_state.remove(&xact_id);
+                self.streaming_transactions_state.remove(&xact_id);
+            }
+            CdcEvent::Insert((table_id, table_row, xact_id)) => {
+                let event_sender = self.event_senders.get_mut(&table_id).unwrap();
+                event_sender
+                    .send(TableEvent::Append {
+                        row: PostgresTableRow(table_row).into(),
+                        xact_id,
+                    })
+                    .await
+                    .unwrap();
+                if let Some(xid) = xact_id {
+                    self.streaming_transactions_state
+                        .entry(xid)
+                        .or_default()
+                        .touched_tables
+                        .insert(table_id);
+                } else {
+                    self.transaction_state.touched_tables.insert(table_id);
                 }
-                CdcEvent::Insert((table_id, table_row, xact_id)) => {
-                    let event_sender = self.event_senders.get_mut(&table_id).unwrap();
-                    event_sender
-                        .send(TableEvent::Append {
-                            row: PostgresTableRow(table_row).into(),
-                            xact_id,
-                        })
-                        .await
-                        .unwrap();
-                    if let Some(xid) = xact_id {
-                        self.streaming_transactions_state
-                            .entry(xid)
-                            .or_default()
-                            .touched_tables
-                            .insert(table_id);
-                    } else {
-                        self.transaction_state.touched_tables.insert(table_id);
-                    }
-                }
-                CdcEvent::Update((table_id, old_table_row, new_table_row, xact_id)) => {
-                    let final_lsn = if let Some(xid) = xact_id {
-                        self.streaming_transactions_state
-                            .entry(xid)
-                            .or_default()
-                            .touched_tables
-                            .insert(table_id);
-                        self.streaming_transactions_state
-                            .get(&xid)
-                            .unwrap()
-                            .final_lsn
-                    } else {
-                        self.transaction_state.touched_tables.insert(table_id);
-                        self.transaction_state.final_lsn
-                    };
+            }
+            CdcEvent::Update((table_id, old_table_row, new_table_row, xact_id)) => {
+                let final_lsn = if let Some(xid) = xact_id {
+                    self.streaming_transactions_state
+                        .entry(xid)
+                        .or_default()
+                        .touched_tables
+                        .insert(table_id);
+                    self.streaming_transactions_state
+                        .get(&xid)
+                        .unwrap()
+                        .final_lsn
+                } else {
+                    self.transaction_state.touched_tables.insert(table_id);
+                    self.transaction_state.final_lsn
+                };
 
-                    let event_sender = self.event_senders.get_mut(&table_id).unwrap();
-                    event_sender
-                        .send(TableEvent::Delete {
-                            row: PostgresTableRow(old_table_row.unwrap()).into(),
-                            lsn: final_lsn,
-                            xact_id,
-                        })
-                        .await
-                        .unwrap();
-                    event_sender
-                        .send(TableEvent::Append {
-                            row: PostgresTableRow(new_table_row).into(),
-                            xact_id,
-                        })
-                        .await
-                        .unwrap();
-                }
-                CdcEvent::Delete((table_id, table_row, xact_id)) => {
-                    let final_lsn = if let Some(xid) = xact_id {
-                        self.streaming_transactions_state
-                            .entry(xid)
-                            .or_default()
-                            .touched_tables
-                            .insert(table_id);
-                        self.streaming_transactions_state
-                            .get(&xid)
-                            .unwrap()
-                            .final_lsn
-                    } else {
-                        self.transaction_state.touched_tables.insert(table_id);
-                        self.transaction_state.final_lsn
-                    };
+                let event_sender = self.event_senders.get_mut(&table_id).unwrap();
+                event_sender
+                    .send(TableEvent::Delete {
+                        row: PostgresTableRow(old_table_row.unwrap()).into(),
+                        lsn: final_lsn,
+                        xact_id,
+                    })
+                    .await
+                    .unwrap();
+                event_sender
+                    .send(TableEvent::Append {
+                        row: PostgresTableRow(new_table_row).into(),
+                        xact_id,
+                    })
+                    .await
+                    .unwrap();
+            }
+            CdcEvent::Delete((table_id, table_row, xact_id)) => {
+                let final_lsn = if let Some(xid) = xact_id {
+                    self.streaming_transactions_state
+                        .entry(xid)
+                        .or_default()
+                        .touched_tables
+                        .insert(table_id);
+                    self.streaming_transactions_state
+                        .get(&xid)
+                        .unwrap()
+                        .final_lsn
+                } else {
+                    self.transaction_state.touched_tables.insert(table_id);
+                    self.transaction_state.final_lsn
+                };
 
-                    let event_sender = self.event_senders.get_mut(&table_id).unwrap();
-                    event_sender
-                        .send(TableEvent::Delete {
-                            row: PostgresTableRow(table_row).into(),
-                            lsn: final_lsn,
-                            xact_id,
-                        })
-                        .await
-                        .unwrap();
-                }
-                CdcEvent::Relation(relation_body) => println!("Relation {relation_body:?}"),
-                CdcEvent::Type(type_body) => println!("Type {type_body:?}"),
-                CdcEvent::PrimaryKeepAlive(primary_keepalive_body) => {
-                    self.replication_state
-                        .mark(PgLsn::from(primary_keepalive_body.wal_end()));
-                }
-                CdcEvent::StreamStop(_stream_stop_body) => {}
-                CdcEvent::StreamAbort(stream_abort_body) => {
-                    let xact_id = stream_abort_body.xid();
-                    if let Some(tables_in_txn) = self.streaming_transactions_state.get(&xact_id) {
-                        for table_id in &tables_in_txn.touched_tables {
-                            let event_sender = self.event_senders.get_mut(table_id).unwrap();
-                            event_sender
-                                .send(TableEvent::StreamAbort { xact_id })
-                                .await
-                                .unwrap();
-                        }
+                let event_sender = self.event_senders.get_mut(&table_id).unwrap();
+                event_sender
+                    .send(TableEvent::Delete {
+                        row: PostgresTableRow(table_row).into(),
+                        lsn: final_lsn,
+                        xact_id,
+                    })
+                    .await
+                    .unwrap();
+            }
+            CdcEvent::Relation(relation_body) => println!("Relation {relation_body:?}"),
+            CdcEvent::Type(type_body) => println!("Type {type_body:?}"),
+            CdcEvent::PrimaryKeepAlive(primary_keepalive_body) => {
+                self.replication_state
+                    .mark(PgLsn::from(primary_keepalive_body.wal_end()));
+            }
+            CdcEvent::StreamStop(_stream_stop_body) => {}
+            CdcEvent::StreamAbort(stream_abort_body) => {
+                let xact_id = stream_abort_body.xid();
+                if let Some(tables_in_txn) = self.streaming_transactions_state.get(&xact_id) {
+                    for table_id in &tables_in_txn.touched_tables {
+                        let event_sender = self.event_senders.get_mut(table_id).unwrap();
+                        event_sender
+                            .send(TableEvent::StreamAbort { xact_id })
+                            .await
+                            .unwrap();
                     }
-                    self.streaming_transactions_state.remove(&xact_id);
                 }
+                self.streaming_transactions_state.remove(&xact_id);
             }
         }
         Ok(PgLsn::from(0))

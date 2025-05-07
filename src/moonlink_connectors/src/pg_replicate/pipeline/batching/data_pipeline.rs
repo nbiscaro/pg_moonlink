@@ -1,6 +1,6 @@
-use std::{collections::HashSet, time::Instant};
+use std::{collections::HashSet, pin::Pin, time::Instant};
 
-use futures::StreamExt;
+use futures::{stream::Stream, StreamExt};
 use tokio::pin;
 use tokio_postgres::types::PgLsn;
 use tracing::{debug, info};
@@ -131,48 +131,29 @@ impl<Src: Source, Snk: BatchSink> BatchDataPipeline<Src, Snk> {
 
         pin!(cdc_events);
 
-        let batch_timeout_stream = BatchTimeoutStream::new(cdc_events, self.batch_config.clone());
-
-        pin!(batch_timeout_stream);
-
-        while let Some(batch) = batch_timeout_stream.next().await {
-            info!("got {} cdc events in a batch", batch.len());
+        while let Some(event) = cdc_events.next().await {
             let mut send_status_update = false;
-            let mut events = Vec::with_capacity(batch.len());
-            for event in batch {
-                if let Err(CdcStreamError::CdcEventConversion(
-                    CdcEventConversionError::MissingSchema(_),
-                )) = event
-                {
-                    continue;
+            if let Err(CdcStreamError::CdcEventConversion(
+                CdcEventConversionError::MissingSchema(_),
+            )) = event
+            {
+                continue;
+            }
+            let event = event.map_err(CommonSourceError::CdcStream)?;
+            match &event {
+                CdcEvent::PrimaryKeepAlive(primary_keepalive_body) => {
+                    send_status_update = primary_keepalive_body.reply() == 1;
                 }
-                let event = event.map_err(CommonSourceError::CdcStream)?;
-                match &event {
-                    CdcEvent::PrimaryKeepAlive(primary_keepalive_body) => {
-                        send_status_update = primary_keepalive_body.reply() == 1;
-                    }
-                    _ => {}
-                }
-                events.push(event);
+                _ => {}
             }
             let last_lsn = self
                 .sink
-                .write_cdc_events(events)
+                .write_cdc_event(event)
                 .await
                 .map_err(PipelineError::Sink)?;
             if send_status_update {
                 info!("sending status update with lsn: {last_lsn}");
-                let inner = unsafe {
-                    batch_timeout_stream
-                        .as_mut()
-                        .get_unchecked_mut()
-                        .get_inner_mut()
-                };
-                inner
-                    .as_mut()
-                    .send_status_update(last_lsn)
-                    .await
-                    .map_err(CommonSourceError::StatusUpdate)?;
+                cdc_events.as_mut().send_status_update(last_lsn).await;
             }
         }
 
