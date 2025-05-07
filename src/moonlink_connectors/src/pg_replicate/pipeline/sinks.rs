@@ -11,8 +11,6 @@ use crate::pg_replicate::{
 
 use super::PipelineResumptionState;
 
-pub mod stdout;
-
 pub trait SinkError: std::error::Error + Send + Sync + 'static {}
 
 #[derive(Debug, Error)]
