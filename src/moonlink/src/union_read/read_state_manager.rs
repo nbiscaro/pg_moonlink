@@ -60,7 +60,6 @@ impl ReadStateManager {
                 current_replication_lsn,
                 current_commit_lsn,
             ) {
-                // If conditions are met, attempt to read from the snapshot and update cache.
                 return self
                     .read_from_snapshot_and_update_cache(
                         current_snapshot_lsn,
@@ -70,7 +69,6 @@ impl ReadStateManager {
                     .await;
             }
 
-            // If conditions are not met, wait for relevant LSNs to change.
             self.wait_for_relevant_lsn_change(
                 requested_lsn.unwrap(),
                 current_replication_lsn,
@@ -81,7 +79,6 @@ impl ReadStateManager {
         }
     }
 
-    /// Checks if the read request can be satisfied with the current LSNs.
     fn can_satisfy_read_from_snapshot(
         &self,
         requested_lsn: Option<u64>,
@@ -104,22 +101,16 @@ impl ReadStateManager {
         }
     }
 
-    /// Reads from the table snapshot, updates the internal cache, and returns the read state.
     async fn read_from_snapshot_and_update_cache(
         &self,
         current_snapshot_lsn: u64,
         current_replication_lsn: u64,
         current_commit_lsn: u64,
     ) -> Result<Arc<ReadState>> {
-        // Acquire locks: read lock for table_snapshot, write lock for last_read_state.
-        // Order matters if other parts of the code acquire these locks in a specific order.
         let table_state_snapshot = self.table_snapshot.read().await;
         let mut last_read_state_guard = self.last_read_state.write().await;
 
-        // Check if another thread updated the cache to a sufficient LSN while we were waiting for locks.
-        // Or, if our current snapshot is indeed newer than what's cached.
         if self.last_read_lsn.load(Ordering::Acquire) < current_snapshot_lsn {
-            // Determine the effective LSN for this read.
             // If the snapshot is fully committed and replication has progressed further,
             // we can consider the state valid up to the replication LSN.
             let effective_lsn = if current_snapshot_lsn == current_commit_lsn
@@ -138,11 +129,9 @@ impl ReadStateManager {
                 read_output.associated_files,
             ));
         }
-        // Return the (potentially updated) cached state.
         Ok(last_read_state_guard.clone())
     }
 
-    /// Waits for either the replication LSN or table snapshot LSN to change.
     async fn wait_for_relevant_lsn_change(
         &self,
         requested_lsn_val: u64,
@@ -150,8 +139,6 @@ impl ReadStateManager {
         replication_lsn_rx: &mut watch::Receiver<u64>,
         table_snapshot_rx: &mut watch::Receiver<u64>,
     ) -> Result<()> {
-        // If requested LSN is beyond current replication LSN, wait for replication.
-        // Otherwise, wait for the table snapshot to catch up.
         if requested_lsn_val > current_replication_lsn {
             replication_lsn_rx
                 .changed()
