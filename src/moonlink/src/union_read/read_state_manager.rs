@@ -1,7 +1,6 @@
 use crate::error::Error;
 use crate::error::Result;
 use crate::storage::MooncakeTable;
-use crate::storage::ReadOutput;
 use crate::storage::SnapshotTableState;
 use crate::union_read::read_state::ReadState;
 use std::sync::atomic::{AtomicU64, Ordering};
