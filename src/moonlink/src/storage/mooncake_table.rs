@@ -309,6 +309,7 @@ impl MooncakeTable {
         if pos.is_none() {
             // Edge‑case: txn deletes a row that's still in the main mem_slice
             // TODO(nbiscaro): This is a bit of a hack. We can likely resolve this in a cleaner way during snapshot.
+            // [https://github.com/Mooncake-Labs/moonlink/issues/126]
             record.pos = self
                 .mem_slice
                 .find_non_deleted_position(&record, &self.metadata.identity);
