@@ -377,7 +377,7 @@ impl MooncakeTable {
             // add transaction deletions to snapshot task
             snapshot_task
                 .new_deletions
-                .extend(stream_state.new_deletions.drain(..));
+                .append(&mut stream_state.new_deletions);
 
             // flush the transaction and add disk slice to snapshot task
             let disk_slice =
