@@ -127,9 +127,6 @@ pub struct SnapshotTask {
     /// Assigned (non-zero) after a commit event.
     new_lsn: u64,
     new_commit_point: Option<RecordLocation>,
-    /// Maps from xact_id to its LSN.
-    flushed_xacts: HashMap<u32, u64>,
-    aborted_xacts: Vec<u32>,
 }
 
 impl SnapshotTask {
@@ -142,8 +139,6 @@ impl SnapshotTask {
             new_mem_indices: Vec::new(),
             new_lsn: 0,
             new_commit_point: None,
-            flushed_xacts: HashMap::new(),
-            aborted_xacts: Vec::new(),
         }
     }
 
@@ -256,7 +251,6 @@ impl MooncakeTable {
             lsn,
             pos: None,
             row_identity: self.metadata.identity.extract_identity_columns(row),
-            xact_id: None,
         };
         let pos = self.mem_slice.delete(&record, &self.metadata.identity);
         record.pos = pos;
@@ -302,7 +296,6 @@ impl MooncakeTable {
             lsn: u64::MAX, // Updated at commit time
             pos: None,
             row_identity: self.metadata.identity.extract_identity_columns(row),
-            xact_id: Some(xact_id),
         };
 
         let stream_state = Self::get_or_create_stream_state(
@@ -315,6 +308,10 @@ impl MooncakeTable {
             .delete(&record, &self.metadata.identity);
         if pos.is_none() {
             // Edge‑case: txn deletes a row that's still in the main mem_slice
+            // TODO(nbiscaro): This is a bit of a hack. We can likely resolve this in a cleaner way during snapshot.
+            record.pos = self
+                .mem_slice
+                .find_non_deleted_position(&record, &self.metadata.identity);
             // NOTE: There is still a remaining edge case that is not yet supported:
             // In the event that we have two identical, rows A and B, with no primary key (using full row as
             // identifier). We may have a situation where we delete A during some streaming
@@ -322,16 +319,16 @@ impl MooncakeTable {
             // delete A twice instead of deleting A then B. A potential solution is to have the
             // main mem slice delete from the top of the matches rows and the streamin transaction
             // to delete from the bottom, but this needs a closer look.
-            record.pos = self
-                .mem_slice
-                .find_non_deleted_position(&record, &self.metadata.identity);
-            self.next_snapshot_task.new_deletions.push(record);
         }
+        self.transaction_stream_states
+            .get_mut(&xact_id)
+            .unwrap()
+            .new_deletions
+            .push(record);
     }
 
     pub fn abort_in_stream_batch(&mut self, xact_id: u32) {
         // Record abortion in snapshot task so we can remove any uncomitted deletions
-        self.next_snapshot_task.aborted_xacts.push(xact_id);
         self.transaction_stream_states.remove(&xact_id);
     }
 
@@ -366,7 +363,10 @@ impl MooncakeTable {
 
     pub async fn flush_transaction_stream(&mut self, xact_id: u32, lsn: u64) -> Result<()> {
         if let Some(mut stream_state) = self.transaction_stream_states.remove(&xact_id) {
-            let mem_slice = &mut stream_state.mem_slice;
+            let xact_mem_slice = &mut stream_state.mem_slice;
+
+            let snapshot_task = &mut self.next_snapshot_task;
+            snapshot_task.new_lsn = lsn;
 
             // We update our delete records with the last lsn of the transaction
             // Note that in the stream case we dont have this until commit time
@@ -374,21 +374,17 @@ impl MooncakeTable {
                 deletion.lsn = lsn;
             }
 
-            let snapshot_task = &mut self.next_snapshot_task;
+            // add transaction deletions to snapshot task
+            snapshot_task
+                .new_deletions
+                .extend(stream_state.new_deletions.drain(..));
 
-            snapshot_task.new_lsn = lsn;
-
-            for deletion in snapshot_task.new_deletions.iter_mut() {
-                if deletion.xact_id == Some(xact_id) {
-                    deletion.lsn = lsn;
-                }
-            }
-
-            snapshot_task.flushed_xacts.insert(xact_id, lsn);
-
+            // flush the transaction and add disk slice to snapshot task
             let disk_slice =
-                Self::inner_flush_data_files(mem_slice, snapshot_task, &self.metadata, lsn).await?;
+                Self::inner_flush_data_files(xact_mem_slice, snapshot_task, &self.metadata, lsn)
+                    .await?;
             self.next_snapshot_task.new_disk_slices.push(disk_slice);
+
             Ok(())
         } else {
             Err(Error::TransactionNotFound(xact_id))
