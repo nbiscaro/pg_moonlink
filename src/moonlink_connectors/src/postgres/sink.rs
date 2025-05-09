@@ -300,10 +300,6 @@ impl BatchSink for Sink {
                 self.streaming_transactions_state.remove(&xact_id); // Fast
             }
             CdcEvent::Insert((table_id, table_row, xact_id)) => {
-                let _insert_processing_guard = ProfileGuard::new(&format!(
-                    "SINK_cdc_event_insert_send_table_{}_xid_{:?}",
-                    table_id, xact_id
-                ));
                 let event_sender = self.event_senders.get_mut(&table_id).unwrap();
                 event_sender
                     .send(TableEvent::Append {
