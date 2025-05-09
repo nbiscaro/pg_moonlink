@@ -186,3 +186,148 @@ async fn test_stream_delete_unflushed_non_streamed_row() {
     env.shutdown().await;
     println!("Test test_stream_delete_unflushed_non_streamed_row passed!");
 }
+
+#[tokio::test]
+async fn test_streaming_transaction_periodic_flush() {
+    let mut env = TestEnvironment::new();
+    let xact_id = 201;
+    let commit_lsn = 20; // LSN at which the transaction will eventually commit
+    let initial_read_lsn_target = commit_lsn; // For verifying no data pre-commit
+    let final_read_lsn_target = commit_lsn; // For verifying all data post-commit
+
+    // --- Phase 1: Append some data to the streaming transaction ---
+    env.append_row(10, "StreamUser1-Part1", 25, Some(xact_id))
+        .await;
+    env.append_row(11, "StreamUser2-Part1", 30, Some(xact_id))
+        .await;
+
+    // --- Phase 2: Perform a periodic flush of the transaction stream ---
+    env.stream_flush(xact_id).await;
+
+    // --- Phase 3: Verify data is NOT visible after flush but BEFORE commit ---
+    env.set_table_commit_lsn(0);
+    env.set_replication_lsn(initial_read_lsn_target + 5);
+
+    env.verify_snapshot(initial_read_lsn_target, &[]).await;
+
+    // --- Phase 4: Append more data to the same transaction AFTER the periodic flush ---
+    env.append_row(12, "StreamUser3-Part2", 35, Some(xact_id))
+        .await;
+
+    // --- Phase 5: Commit the streaming transaction ---
+    env.stream_commit(commit_lsn, xact_id).await;
+
+    // --- Phase 6: Verify ALL data (before and after periodic flush) is visible after commit ---
+
+    env.set_table_commit_lsn(commit_lsn);
+    env.set_replication_lsn(final_read_lsn_target + 5);
+
+    env.verify_snapshot(final_read_lsn_target, &[10, 11, 12])
+        .await;
+
+    env.shutdown().await;
+}
+
+#[tokio::test]
+async fn test_stream_delete_previously_flushed_row_same_xact() {
+    let mut env = TestEnvironment::new();
+    let xact_id = 401;
+    let stream_commit_lsn = 40;
+
+    // Phase 1: Append Row A (ID:10) to stream, then periodic flush
+    env.append_row(10, "UserA-StreamFlush", 25, Some(xact_id))
+        .await;
+    env.stream_flush(xact_id).await; // Row A now in a xact-specific disk slice
+
+    // Phase 2: In same stream, delete Row A (ID:10), append Row B (ID:11)
+    env.delete_row(10, "UserA-StreamFlush", 25, 0, Some(xact_id))
+        .await; // LSN placeholder
+    env.append_row(11, "UserB-StreamSurvived", 30, Some(xact_id))
+        .await;
+
+    // Phase 3: Verify data is NOT visible before commit
+    env.set_table_commit_lsn(0);
+    env.set_replication_lsn(stream_commit_lsn + 5);
+    env.verify_snapshot(stream_commit_lsn, &[]).await;
+
+    // Phase 4: Commit the streaming transaction
+    env.stream_commit(stream_commit_lsn, xact_id).await;
+
+    // Phase 5: Verify final state
+    env.set_table_commit_lsn(stream_commit_lsn);
+    env.set_replication_lsn(stream_commit_lsn + 5);
+    env.verify_snapshot(stream_commit_lsn, &[11]).await; // Only Row B (ID:11) should exist
+
+    env.shutdown().await;
+}
+
+#[tokio::test]
+async fn test_stream_delete_from_stream_memslice_row() {
+    let mut env = TestEnvironment::new();
+    let xact_id = 402;
+    let stream_commit_lsn = 41;
+
+    env.append_row(20, "UserC-StreamMem", 35, Some(xact_id))
+        .await;
+
+    // Phase 2: Delete Row C (ID:20) from stream's mem_slice, append Row D (ID:21)
+    env.delete_row(20, "UserC-StreamMem", 35, 0, Some(xact_id))
+        .await; // LSN placeholder
+    env.append_row(21, "UserD-StreamSurvived", 40, Some(xact_id))
+        .await;
+
+    // Phase 3: Verify data is NOT visible before commit
+    env.set_table_commit_lsn(0);
+    env.set_replication_lsn(stream_commit_lsn + 5);
+    env.verify_snapshot(stream_commit_lsn, &[]).await;
+
+    // Phase 4: Commit the streaming transaction
+    env.stream_commit(stream_commit_lsn, xact_id).await;
+
+    println!("Phase 5: Verifying final state post-commit");
+    // Phase 5: Verify final state
+    env.set_table_commit_lsn(stream_commit_lsn);
+    env.set_replication_lsn(stream_commit_lsn + 5);
+    env.verify_snapshot(stream_commit_lsn, &[21]).await; // Only Row D (ID:21) should exist
+
+    env.shutdown().await;
+}
+
+#[tokio::test]
+async fn test_stream_delete_from_main_disk_row() {
+    let mut env = TestEnvironment::new();
+    let main_commit_lsn_flushed = 5; // LSN for the row that will be on disk
+    let xact_id = 403;
+    let stream_commit_lsn = 42;
+
+    // Phase 1: Setup - Append Row G (ID:40), commit, and explicitly flush it to main disk
+    env.append_row(40, "UserG-MainDisk", 50, None).await;
+    env.commit(main_commit_lsn_flushed).await;
+    env.flush_table(main_commit_lsn_flushed).await; // Explicit flush
+    env.set_table_commit_lsn(main_commit_lsn_flushed);
+    env.set_replication_lsn(main_commit_lsn_flushed + 5);
+    env.verify_snapshot(main_commit_lsn_flushed, &[40]).await;
+
+    // Phase 2: Start streaming transaction, delete Row G (ID:40), append Row H (ID:41)
+    env.delete_row(40, "UserG-MainDisk", 50, 0, Some(xact_id))
+        .await; // LSN placeholder
+    env.append_row(41, "UserH-StreamSurvived", 55, Some(xact_id))
+        .await;
+
+    // Phase 3: Verify data is NOT visible before stream commit (Row G should still be there)
+    // table_commit_lsn is still main_commit_lsn_flushed (5)
+    env.set_replication_lsn(stream_commit_lsn + 5);
+    // Effective read LSN = min(target=42, table_commit=5, replication=47) = 5
+    env.verify_snapshot(stream_commit_lsn, &[40]).await; // Row G should still be visible
+
+    // Phase 4: Commit the streaming transaction
+    env.stream_commit(stream_commit_lsn, xact_id).await;
+
+    // Phase 5: Verify final state
+    env.set_table_commit_lsn(stream_commit_lsn);
+    env.set_replication_lsn(stream_commit_lsn + 5);
+    // Effective read LSN = min(target=42, table_commit=42, replication=47) = 42
+    env.verify_snapshot(stream_commit_lsn, &[41]).await; // Only Row H (ID:41) should exist
+
+    env.shutdown().await;
+}
