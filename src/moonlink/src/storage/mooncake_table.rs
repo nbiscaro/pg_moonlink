@@ -296,6 +296,7 @@ impl MooncakeTable {
         let pos = stream_state
             .mem_slice
             .delete(&record, &self.metadata.identity);
+        record.pos = pos;
         if pos.is_none() {
             // Edge‑case: txn deletes a row that's still in the main mem_slice
             // TODO(nbiscaro): This is a bit of a hack. We can likely resolve this in a cleaner way during snapshot.
