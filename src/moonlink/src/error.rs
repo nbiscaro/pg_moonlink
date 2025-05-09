@@ -24,6 +24,9 @@ pub enum Error {
         #[source]
         source: watch::error::RecvError,
     },
+
+    #[error("Tokio join error: {0}")]
+    TokioJoinError(String),
 }
 
 pub type Result<T> = result::Result<T, Error>;
