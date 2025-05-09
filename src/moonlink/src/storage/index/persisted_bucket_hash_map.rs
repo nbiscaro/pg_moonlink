@@ -11,6 +11,9 @@ use std::io::SeekFrom;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+// Add ProfileGuard
+use crate::profiling::ProfileGuard;
+
 // Constants
 const HASH_BITS: u32 = 64;
 const _MAX_BLOCK_SIZE: u32 = 2 * 1024 * 1024 * 1024; // 2GB
@@ -62,6 +65,7 @@ impl IndexBlock {
         directory: &Path,
         file_name: String,
     ) -> Self {
+        let _guard = ProfileGuard::new(&format!("INDEX_BLOCK_new_file_{}", file_name));
         let file = File::open(directory.join(&file_name)).unwrap();
         let data = unsafe { Mmap::map(&file).unwrap() };
         Self {
@@ -126,6 +130,10 @@ impl IndexBlock {
         bucket_idx: u32,
         metadata: &GlobalIndex,
     ) -> Vec<RecordLocation> {
+        let _guard = ProfileGuard::new(&format!(
+            "INDEX_BLOCK_read_bucket_{}_target_hash_part_{}",
+            bucket_idx, target_lower_hash
+        ));
         assert!(bucket_idx >= self.bucket_start_idx && bucket_idx < self.bucket_end_idx);
         let cursor = Cursor::new(self.data.as_ref());
         let mut reader = BitReader::endian(cursor, BigEndian);
@@ -140,13 +148,19 @@ impl IndexBlock {
                             as u64,
                 ))
                 .unwrap();
-            for _i in entry_start..entry_end {
-                let (hash, seg_idx, row_idx) = self.read_entry(&mut entry_reader, metadata);
-                if hash == target_lower_hash {
-                    results.push(RecordLocation::DiskFile(
-                        FileId(metadata.files[seg_idx].clone()),
-                        row_idx,
-                    ));
+            {
+                let _entry_loop_guard = ProfileGuard::new(&format!(
+                    "INDEX_BLOCK_read_entry_loop_count_{}",
+                    entry_end - entry_start
+                ));
+                for _i in entry_start..entry_end {
+                    let (hash, seg_idx, row_idx) = self.read_entry(&mut entry_reader, metadata);
+                    if hash == target_lower_hash {
+                        results.push(RecordLocation::DiskFile(
+                            FileId(metadata.files[seg_idx].clone()),
+                            row_idx,
+                        ));
+                    }
                 }
             }
             results
@@ -158,6 +172,7 @@ impl IndexBlock {
 
 impl GlobalIndex {
     pub fn search(&self, value: &u64) -> Vec<RecordLocation> {
+        let _guard = ProfileGuard::new(&format!("GLOBAL_INDEX_search_value_{}", value));
         let target_hash = splitmix64(*value);
         let lower_hash = target_hash & ((1 << self.hash_lower_bits) - 1);
         let bucket_idx = (target_hash >> self.hash_lower_bits) as u32;
@@ -190,6 +205,10 @@ struct IndexBlockBuilder {
 
 impl IndexBlockBuilder {
     pub fn new(bucket_start_idx: u32, bucket_end_idx: u32, directory: PathBuf) -> Self {
+        let _guard = ProfileGuard::new(&format!(
+            "INDEX_BLOCK_BUILDER_new_dir_{:?}_buckets_{}-{}",
+            directory, bucket_start_idx, bucket_end_idx
+        ));
         let file_name = format!("index_block_{}.bin", uuid::Uuid::new_v4());
         let file = File::create(directory.join(&file_name)).unwrap();
         let buf_writer = BufWriter::new(file);
@@ -233,18 +252,28 @@ impl IndexBlockBuilder {
     }
 
     pub fn build(mut self, metadata: &GlobalIndex) -> IndexBlock {
+        let _guard = ProfileGuard::new(&format!(
+            "INDEX_BLOCK_BUILDER_build_file_{}",
+            self.file_name
+        ));
         for i in self.current_bucket + 1..self.bucket_end_idx {
             self.buckets[i as usize] = self.current_entry;
         }
         let bucket_start_offset = (self.current_entry as u64)
             * (metadata.hash_lower_bits + metadata.seg_id_bits + metadata.row_id_bits) as u64;
-        for bucket in self.buckets {
-            self.entry_writer
-                .write_unsigned_var(metadata.bucket_bits, bucket)
-                .unwrap();
+        {
+            let _write_buckets_guard = ProfileGuard::new("INDEX_BLOCK_BUILDER_build_write_buckets");
+            for bucket in self.buckets {
+                self.entry_writer
+                    .write_unsigned_var(metadata.bucket_bits, bucket)
+                    .unwrap();
+            }
         }
-        self.entry_writer.byte_align().unwrap();
-        drop(self.entry_writer);
+        {
+            let _flush_writer_guard = ProfileGuard::new("INDEX_BLOCK_BUILDER_build_flush_writer");
+            self.entry_writer.byte_align().unwrap();
+            drop(self.entry_writer);
+        }
         IndexBlock::new(
             self.bucket_start_idx,
             self.bucket_end_idx,
@@ -281,15 +310,31 @@ impl GlobalIndexBuilder {
     }
 
     pub fn build_from_flush(mut self, mut entries: Vec<(u64, usize, usize)>) -> GlobalIndex {
+        let _guard = ProfileGuard::new(&format!(
+            "GLOBAL_INDEX_BUILDER_build_from_flush_entries_{}",
+            entries.len()
+        ));
         self.num_rows = entries.len() as u32;
-        for entry in &mut entries {
-            entry.0 = splitmix64(entry.0);
+        {
+            let _hash_entries_guard =
+                ProfileGuard::new("GLOBAL_INDEX_BUILDER_build_from_flush_hash_entries");
+            for entry in &mut entries {
+                entry.0 = splitmix64(entry.0);
+            }
         }
-        entries.sort_by_key(|entry| entry.0);
+        {
+            let _sort_entries_guard =
+                ProfileGuard::new("GLOBAL_INDEX_BUILDER_build_from_flush_sort_entries");
+            entries.sort_by_key(|entry| entry.0);
+        }
         self.build(entries.into_iter())
     }
 
     pub fn _build_from_merge(mut self, indices: Vec<GlobalIndex>) -> GlobalIndex {
+        let _guard = ProfileGuard::new(&format!(
+            "GLOBAL_INDEX_BUILDER_build_from_merge_indices_count_{}",
+            indices.len()
+        ));
         self.num_rows = indices.iter().map(|index| index.num_rows).sum();
         self.files = indices
             .iter()
@@ -315,6 +360,10 @@ impl GlobalIndexBuilder {
     }
 
     fn build(self, iter: impl Iterator<Item = (u64, usize, usize)>) -> GlobalIndex {
+        let _guard = ProfileGuard::new(&format!(
+            "GLOBAL_INDEX_BUILDER_build_internal_num_rows_{}",
+            self.num_rows
+        ));
         let num_rows = self.num_rows;
         let bucket_bits = 32 - num_rows.leading_zeros();
         let num_buckets = (num_rows / 4 + 2).next_power_of_two();
@@ -335,8 +384,12 @@ impl GlobalIndexBuilder {
         let mut index_blocks = Vec::new();
         let mut index_block_builder =
             IndexBlockBuilder::new(0, num_buckets + 1, self.directory.clone());
-        for entry in iter {
-            index_block_builder.write_entry(entry.0, entry.1, entry.2, &global_index);
+        {
+            let _write_entries_loop_guard =
+                ProfileGuard::new("GLOBAL_INDEX_BUILDER_build_internal_write_entries_loop");
+            for entry in iter {
+                index_block_builder.write_entry(entry.0, entry.1, entry.2, &global_index);
+            }
         }
         index_blocks.push(index_block_builder.build(&global_index));
         global_index.index_blocks = index_blocks;

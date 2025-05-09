@@ -5,37 +5,27 @@ use crate::storage::index::{FileIndex, MemIndex};
 use crate::storage::storage_utils::{FileId, ProcessedDeletionRecord, RecordLocation};
 use arrow_array::RecordBatch;
 use arrow_schema::Schema;
-use parquet::arrow::ArrowWriter;
+use parquet::arrow::ArrowWriter; // ArrowWriter::write and close are key I/O points
 use std::collections::HashMap;
-use std::fs::File;
+use std::fs::File; // File::create
 use std::path::PathBuf;
 use std::sync::Arc;
 use uuid::Uuid;
 
+// Add ProfileGuard
+use crate::profiling::ProfileGuard;
+
 // TODO(hjiang): Split into two structs, DiskSliceWriter and DiskSlice.
 pub(crate) struct DiskSliceWriter {
-    /// The schema of the DiskSlice.
-    ///
     schema: Arc<Schema>,
-
     dir_path: PathBuf,
-
-    // input
     batches: Vec<BatchEntry>,
-
     writer_lsn: Option<u64>,
-
     old_index: Arc<MemIndex>,
-
-    // a mapping of old record locations to new record locations
-    // this is used to remap deletions on the disk slice
     batch_id_to_idx: HashMap<u64, usize>,
     row_offset_mapping: Vec<Vec<Option<(usize, usize)>>>,
-
     new_index: Option<FileIndex>,
-
-    /// Records already flushed data files.
-    files: Vec<(PathBuf /* file path */, usize /* row count */)>,
+    files: Vec<(PathBuf, usize)>,
 }
 
 impl DiskSliceWriter {
@@ -52,6 +42,7 @@ impl DiskSliceWriter {
         writer_lsn: Option<u64>,
         old_index: Arc<MemIndex>,
     ) -> Self {
+        // new() is cheap, mostly struct initialization.
         Self {
             schema,
             dir_path,
@@ -67,136 +58,214 @@ impl DiskSliceWriter {
 
     /// Apply deletion vector to in-memory batches, write to parquet files and remap index.
     pub(super) fn write(&mut self) -> Result<()> {
+        // This is the main orchestrator for disk writing.
+        let _guard = ProfileGuard::new(&format!(
+            "DS_WRITER_write_dir_{:?}_lsn_{:?}_batches_{}",
+            self.dir_path,
+            self.writer_lsn,
+            self.batches.len()
+        ));
+
         let mut filtered_batches = Vec::new();
         let mut id = 0;
-        for entry in self.batches.iter() {
-            let filtered_batch = entry.batch.get_filtered_batch()?;
-            if let Some(batch) = filtered_batch {
-                let total_rows = entry.batch.data.as_ref().unwrap().num_rows();
-                filtered_batches.push((
-                    id,
-                    batch,
-                    entry.batch.deletions.collect_active_rows(total_rows),
-                ));
-                let mut mapping = Vec::with_capacity(total_rows);
-                mapping.resize(total_rows, None);
-                self.row_offset_mapping.push(mapping);
-                self.batch_id_to_idx.insert(entry.id, id);
-                id += 1;
+        // Part 1: Filtering batches based on deletions. This is CPU-bound.
+        {
+            let _filter_guard = ProfileGuard::new(&format!(
+                "DS_WRITER_write_filter_batches_count_{}",
+                self.batches.len()
+            ));
+            for entry in self.batches.iter() {
+                // entry.batch.get_filtered_batch() could be significant if batches are large/deletions complex.
+                let filtered_batch_opt = {
+                    let _get_filtered_guard = ProfileGuard::new(&format!(
+                        "DS_WRITER_write_get_filtered_batch_id_{}",
+                        entry.id
+                    ));
+                    entry.batch.get_filtered_batch()?
+                };
+
+                if let Some(batch_val) = filtered_batch_opt {
+                    // Renamed
+                    let total_rows = entry.batch.data.as_ref().unwrap().num_rows();
+                    filtered_batches.push((
+                        id,
+                        batch_val, // Use renamed
+                        entry.batch.deletions.collect_active_rows(total_rows),
+                    ));
+                    let mut mapping = Vec::with_capacity(total_rows);
+                    mapping.resize(total_rows, None);
+                    self.row_offset_mapping.push(mapping);
+                    self.batch_id_to_idx.insert(entry.id, id);
+                    id += 1;
+                }
             }
         }
+
+        // Part 2: Writing to Parquet. This involves I/O.
+        // self.write_batch_to_parquet is profiled internally.
         self.write_batch_to_parquet(&filtered_batches)?;
+
+        // Part 3: Remapping index. This is CPU-bound.
+        // self.remap_index is profiled internally.
         self.remap_index()?;
         Ok(())
     }
 
     pub(super) fn lsn(&self) -> Option<u64> {
-        self.writer_lsn
+        self.writer_lsn // cheap
     }
 
     pub(super) fn set_lsn(&mut self, lsn: Option<u64>) {
-        self.writer_lsn = lsn;
+        self.writer_lsn = lsn; // cheap
     }
 
     pub(super) fn input_batches(&self) -> &Vec<BatchEntry> {
-        &self.batches
+        &self.batches // cheap
     }
-    /// Get the list of files in the DiskSlice
+
     pub(super) fn output_files(&self) -> &[(PathBuf, usize)] {
-        self.files.as_slice()
+        self.files.as_slice() // cheap
     }
 
     pub(super) fn old_index(&self) -> &Arc<MemIndex> {
-        &self.old_index
+        &self.old_index // cheap
     }
 
     /// Write record batches to parquet files in synchronous mode.
-    /// TODO(hjiang): Parallelize the parquet file write operations.
     fn write_batch_to_parquet(
         &mut self,
         record_batches: &Vec<(usize, RecordBatch, Vec<usize>)>,
     ) -> Result<()> {
-        let mut files = Vec::new();
-        let mut writer = None;
+        let _guard = ProfileGuard::new(&format!(
+            "DS_WRITER_write_batch_to_parquet_num_input_batches_{}",
+            record_batches.len()
+        ));
+        let mut files_vec = Vec::new(); // Renamed from files
+        let mut current_writer = None; // Renamed from writer
         let mut out_file_idx = 0;
         let mut out_row_idx = 0;
-        let dir_path = &self.dir_path;
-        let mut file_path = None;
-        for (batch_id, batch, row_indices) in record_batches {
-            if writer.is_none() {
-                // Generate a unique file name
-                // Create the file
+        let dir_path_ref = &self.dir_path; // Renamed from dir_path
+        let mut current_file_path = None; // Renamed from file_path
+
+        for (batch_id, batch_ref, row_indices) in record_batches {
+            // Renamed from batch
+            if current_writer.is_none() {
+                let _file_create_guard =
+                    ProfileGuard::new("DS_WRITER_parquet_create_file_and_writer");
                 let file_name = format!("{}.parquet", Uuid::new_v4());
-                file_path = Some(dir_path.join(file_name));
-                let file = File::create(file_path.as_ref().unwrap()).map_err(Error::Io)?;
-                out_file_idx = files.len();
-                writer = Some(ArrowWriter::try_new(file, self.schema.clone(), None)?);
+                current_file_path = Some(dir_path_ref.join(file_name));
+                let file_obj =
+                    File::create(current_file_path.as_ref().unwrap()).map_err(Error::Io)?; // Renamed
+                out_file_idx = files_vec.len();
+                current_writer = Some(ArrowWriter::try_new(file_obj, self.schema.clone(), None)?);
                 out_row_idx = 0;
             }
-            for row_idx in row_indices {
-                self.row_offset_mapping[*batch_id][*row_idx] = Some((out_file_idx, out_row_idx));
-                out_row_idx += 1;
+
+            // Row offset mapping is CPU work.
+            {
+                let _offset_mapping_guard = ProfileGuard::new(&format!(
+                    "DS_WRITER_parquet_offset_mapping_batch_id_{}_rows_{}",
+                    batch_id,
+                    row_indices.len()
+                ));
+                for row_idx_ref in row_indices {
+                    // Renamed from row_idx
+                    self.row_offset_mapping[*batch_id][*row_idx_ref] =
+                        Some((out_file_idx, out_row_idx));
+                    out_row_idx += 1;
+                }
             }
-            // Write the batch
-            writer.as_mut().unwrap().write(batch)?;
-            if writer.as_ref().unwrap().memory_size() > Self::PARQUET_FILE_SIZE {
-                // Finalize the writer
-                writer.unwrap().close()?;
-                writer = None;
-                files.push((file_path.unwrap(), out_row_idx));
-                file_path = None;
+
+            // Actual Parquet write.
+            {
+                let _parquet_write_call_guard = ProfileGuard::new(&format!(
+                    "DS_WRITER_parquet_ArrowWriter_write_batch_id_{}",
+                    batch_id
+                ));
+                current_writer.as_mut().unwrap().write(batch_ref)?;
+            }
+
+            // Check if file size limit is reached.
+            if current_writer.as_ref().unwrap().memory_size() > Self::PARQUET_FILE_SIZE {
+                let _parquet_close_guard =
+                    ProfileGuard::new("DS_WRITER_parquet_ArrowWriter_close_due_to_size");
+                current_writer.unwrap().close()?; // This flushes to disk.
+                current_writer = None;
+                files_vec.push((current_file_path.unwrap(), out_row_idx));
+                current_file_path = None;
             }
         }
-        if let Some(writer) = writer {
-            writer.close()?;
 
-            println!("flush parquet file to local disk slice");
-
-            files.push((file_path.unwrap(), out_row_idx));
+        // Close the last writer if it exists.
+        if let Some(writer_val) = current_writer {
+            // Renamed from writer
+            let _parquet_final_close_guard =
+                ProfileGuard::new("DS_WRITER_parquet_ArrowWriter_final_close");
+            writer_val.close()?; // This flushes to disk.
+            println!("flush parquet file to local disk slice"); // Existing log
+            files_vec.push((current_file_path.unwrap(), out_row_idx));
         }
-        self.files = files;
+        self.files = files_vec;
         Ok(())
     }
 
     fn remap_index(&mut self) -> Result<()> {
-        let list = self
-            .old_index
-            .iter()
-            .filter_map(|(key, value)| {
-                let RecordLocation::MemoryBatch(batch_id, row_idx) = value else {
-                    panic!("Invalid record location");
-                };
-                let old_location = (*self.batch_id_to_idx.get(batch_id).unwrap(), *row_idx);
-                let new_location = self.row_offset_mapping[old_location.0][old_location.1];
-                new_location.map(|new_location| (*key, new_location.0, new_location.1))
-            })
-            .collect::<Vec<_>>();
-        let mut index_builder = GlobalIndexBuilder::new();
-        index_builder.set_files(
-            self.files
+        let _guard = ProfileGuard::new("DS_WRITER_remap_index");
+        // Iterating and filtering the old index. CPU-bound.
+        let list_val = {
+            // Renamed
+            let _iter_filter_guard =
+                ProfileGuard::new("DS_WRITER_remap_index_iter_filter_old_index");
+            self.old_index
                 .iter()
-                .map(|(path, _)| Arc::new(path.clone()))
-                .collect(),
-        );
-        index_builder.set_directory(self.dir_path.clone());
-        self.new_index = Some(index_builder.build_from_flush(list));
+                .filter_map(|(key, value)| {
+                    let RecordLocation::MemoryBatch(batch_id, row_idx) = value else {
+                        panic!("Invalid record location");
+                    };
+                    let old_location = (*self.batch_id_to_idx.get(batch_id).unwrap(), *row_idx);
+                    let new_location_opt = self.row_offset_mapping[old_location.0][old_location.1]; // Renamed
+                    new_location_opt.map(|new_loc| (*key, new_loc.0, new_loc.1))
+                    // Renamed
+                })
+                .collect::<Vec<_>>()
+        };
+
+        // Building the new global index. CPU-bound, involves hash map construction.
+        let new_file_index = {
+            // Renamed
+            let _build_index_guard =
+                ProfileGuard::new("DS_WRITER_remap_index_GlobalIndexBuilder_build");
+            let mut index_builder = GlobalIndexBuilder::new();
+            index_builder.set_files(
+                self.files
+                    .iter()
+                    .map(|(path, _)| Arc::new(path.clone()))
+                    .collect(),
+            );
+            index_builder.set_directory(self.dir_path.clone());
+            index_builder.build_from_flush(list_val) // Use renamed
+        };
+        self.new_index = Some(new_file_index);
         Ok(())
     }
 
     pub fn take_index(&mut self) -> Option<FileIndex> {
-        self.new_index.take()
+        self.new_index.take() // cheap
     }
 
     pub fn remap_deletion_if_needed(&self, deletion: &mut ProcessedDeletionRecord) {
+        // This is a synchronous, conditional update. Usually fast.
+        // Not profiling unless it becomes a high-frequency hot spot.
         if let RecordLocation::MemoryBatch(batch_id, row_idx) = &deletion.pos {
             let batch_was_flushed = self.batch_id_to_idx.contains_key(batch_id);
             if batch_was_flushed {
                 let old_location = (*self.batch_id_to_idx.get(batch_id).unwrap(), *row_idx);
-                let new_location = self.row_offset_mapping[old_location.0][old_location.1];
-                if let Some(new_location) = new_location {
+                let new_location_opt = self.row_offset_mapping[old_location.0][old_location.1]; // Renamed
+                if let Some(new_loc) = new_location_opt {
+                    // Renamed
                     deletion.pos = RecordLocation::DiskFile(
-                        FileId(Arc::new(self.files[new_location.0].0.clone())),
-                        new_location.1,
+                        FileId(Arc::new(self.files[new_loc.0].0.clone())),
+                        new_loc.1,
                     );
                 }
             }
@@ -217,9 +286,7 @@ mod tests {
 
     #[test]
     fn test_disk_slice_builder() -> Result<()> {
-        // Create a temporary directory for the test
         let temp_dir = tempdir().map_err(Error::Io)?;
-        // Create a schema for testing
         let schema = Arc::new(Schema::new(vec![
             Field::new("id", DataType::Int32, false).with_metadata(HashMap::from([(
                 "PARQUET:field_id".to_string(),
@@ -230,11 +297,7 @@ mod tests {
                 "2".to_string(),
             )])),
         ]));
-
-        // Create a MemSlice with test data
         let mut mem_slice = MemSlice::new(schema.clone(), 100);
-
-        // Add some test rows
         let row1 = MoonlinkRow::new(vec![
             RowValue::Int32(1),
             RowValue::ByteArray("Alice".as_bytes().to_vec()),
@@ -243,14 +306,12 @@ mod tests {
             RowValue::Int32(2),
             RowValue::ByteArray("Bob".as_bytes().to_vec()),
         ]);
-
         mem_slice.append(1, row1)?;
         mem_slice.append(2, row2)?;
         let (_new_batch, entries, _index) = mem_slice.drain().unwrap();
         let mut old_index = MemIndex::new();
         old_index.insert(1, RecordLocation::MemoryBatch(0, 0));
         old_index.insert(2, RecordLocation::MemoryBatch(0, 1));
-
         let mut disk_slice = DiskSliceWriter::new(
             schema,
             temp_dir.path().to_path_buf(),
@@ -259,32 +320,23 @@ mod tests {
             Arc::new(old_index),
         );
         disk_slice.write()?;
-        // Verify files were created
         assert!(!disk_slice.output_files().is_empty());
         println!("Files: {:?}", disk_slice.output_files());
-
-        // Read the files and verify the data
         for (file, _rows) in disk_slice.output_files() {
             let file = File::open(file).map_err(Error::Io)?;
             let builder = ParquetRecordBatchReaderBuilder::try_new(file).unwrap();
             println!("Converted arrow schema is: {}", builder.schema());
-
             let mut reader = builder.build().unwrap();
             let record_batch = reader.next().unwrap().unwrap();
             println!("{:?}", record_batch);
         }
-        // Clean up temporary directory
         temp_dir.close().map_err(Error::Io)?;
-
         Ok(())
     }
 
     #[test]
     fn test_index_remapping() -> Result<()> {
-        // Create a temporary directory for the test
         let temp_dir = tempdir().map_err(Error::Io)?;
-
-        // Create a schema for testing
         let schema = Arc::new(Schema::new(vec![
             Field::new("id", DataType::Int32, false).with_metadata(HashMap::from([(
                 "PARQUET:field_id".to_string(),
@@ -295,11 +347,7 @@ mod tests {
                 "2".to_string(),
             )])),
         ]));
-
-        // Create a MemSlice with test data - more rows this time
         let mut mem_slice = MemSlice::new(schema.clone(), 3);
-
-        // Add several test rows
         let rows = [
             MoonlinkRow::new(vec![
                 RowValue::Int32(1),
@@ -322,8 +370,6 @@ mod tests {
                 RowValue::ByteArray("Eve".as_bytes().to_vec()),
             ]),
         ];
-
-        // Insert original keys into the index
         for row in rows.into_iter() {
             let key = match row.values[0] {
                 RowValue::Int32(v) => v as u64,
@@ -331,8 +377,6 @@ mod tests {
             };
             mem_slice.append(key, row)?;
         }
-
-        // Delete a couple of rows to test that only active rows are mapped
         mem_slice.delete(
             &RawDeletionRecord {
                 lookup_key: 2,
@@ -341,7 +385,7 @@ mod tests {
                 lsn: 1,
             },
             &Identity::SinglePrimitiveKey(0),
-        ); // Delete Bob (ID 2)
+        );
         mem_slice.delete(
             &RawDeletionRecord {
                 lookup_key: 4,
@@ -350,10 +394,8 @@ mod tests {
                 lsn: 1,
             },
             &Identity::SinglePrimitiveKey(0),
-        ); // Delete David (ID 4)
-
+        );
         let (_new_batch, entries, index) = mem_slice.drain().unwrap();
-
         let mut disk_slice = DiskSliceWriter::new(
             schema,
             temp_dir.path().to_path_buf(),
@@ -361,30 +403,19 @@ mod tests {
             Some(1),
             Arc::new(index),
         );
-
-        // Write the disk slice
         disk_slice.write()?;
-
-        // Verify files were created
         assert!(!disk_slice.output_files().is_empty());
         println!("Files created: {:?}", disk_slice.output_files());
-
-        // Get the remapped index and verify it
         let new_index = disk_slice.take_index().unwrap();
-
-        // Verify each key has been remapped to a disk location
         for key in [1, 3, 5] {
-            // These should exist (undeleted rows)
             let locations = new_index.search(&key);
             assert!(
                 !locations.is_empty(),
                 "Key {key} should exist in the remapped index"
             );
-
             for location in locations {
                 match location {
                     RecordLocation::DiskFile(file_id, _) => {
-                        // Verify the file exists in our output files
                         let file_path = &file_id.0;
                         assert!(
                             disk_slice
@@ -398,20 +429,14 @@ mod tests {
                 }
             }
         }
-
-        // Check that deleted rows are not in the index
         for key in [2, 4] {
-            // These should not exist (deleted rows)
             let locations = new_index.search(&key);
             assert!(
                 locations.is_empty(),
                 "Deleted key {key} should not exist in the remapped index"
             );
         }
-
-        // Clean up temporary directory
         temp_dir.close().map_err(Error::Io)?;
-
         Ok(())
     }
 }

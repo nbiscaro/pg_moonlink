@@ -1,4 +1,5 @@
 pub mod error;
+mod profiling;
 pub mod row;
 mod storage;
 mod table_handler;

@@ -26,6 +26,9 @@ use iceberg::Result as IcebergResult;
 use typed_builder::TypedBuilder;
 use uuid::Uuid;
 
+// Add ProfileGuard
+use crate::profiling::ProfileGuard;
+
 #[cfg(test)]
 use mockall::*;
 
@@ -48,19 +51,11 @@ pub struct IcebergTableManagerConfig {
 #[allow(dead_code)]
 #[cfg_attr(test, automock)]
 pub(crate) trait IcebergOperation {
-    /// Write a new snapshot to iceberg table.
-    /// It could be called for multiple times to write and commit multiple snapshots.
-    ///
-    /// Please notice, it takes full content to commit snapshot.
-    ///
-    /// TODO(hjiang): We're storing the iceberg table status in two places, one for iceberg table manager, another at snapshot.
-    /// Provide delta change interface, so snapshot doesn't need to store everything.
     async fn sync_snapshot(
         &mut self,
         snapshot_disk_files: HashMap<PathBuf, BatchDeletionVector>,
     ) -> IcebergResult<()>;
 
-    /// Load latest snapshot from iceberg table. Used for recovery and initialization.
     async fn load_snapshot_from_table(&mut self) -> IcebergResult<()>
     where
         Self: Sized;
@@ -69,35 +64,32 @@ pub(crate) trait IcebergOperation {
 #[allow(dead_code)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct DataFileEntry {
-    /// Iceberg data file, used to decide what to persist at new commit requests.
     data_file: DataFile,
-    /// In-memory deletion vector.
     deletion_vector: BatchDeletionVector,
 }
 
-/// TODO(hjiang):
-/// 1. Support a data file handle, which is a remote file path, plus an optional local cache filepath.
-/// 2. Support a deletion vector handle, which is a remote file path, with an optional in-memory buffer and a local cache filepath.
 #[allow(dead_code)]
 #[derive(Debug)]
 pub struct IcebergTableManager {
-    /// Iceberg table configuration.
     config: IcebergTableManagerConfig,
-
-    /// Iceberg catalog, which interacts with the iceberg table.
     catalog: Box<dyn MoonlinkCatalog>,
-
-    /// The iceberg table it's managing.
     iceberg_table: Option<IcebergTable>,
-
-    /// Maps from already persisted data file filepath to its deletion vector, and iceberg `DataFile`.
     persisted_items: HashMap<PathBuf, DataFileEntry>,
 }
 
 impl IcebergTableManager {
     #[allow(dead_code)]
     pub fn new(config: IcebergTableManagerConfig) -> IcebergTableManager {
-        let catalog = catalog_utils::create_catalog(&config.warehouse_uri).unwrap();
+        let _guard = ProfileGuard::new(&format!(
+            "ICEBERG_MGR_new_table_{}_{}",
+            config.namespace.join("."),
+            config.table_name
+        ));
+        // catalog_utils::create_catalog is synchronous.
+        let catalog = {
+            let _create_catalog_guard = ProfileGuard::new("ICEBERG_MGR_new_create_catalog");
+            catalog_utils::create_catalog(&config.warehouse_uri).unwrap()
+        };
         Self {
             config,
             catalog,
@@ -106,35 +98,49 @@ impl IcebergTableManager {
         }
     }
 
-    /// Get or create an iceberg table, and load full table status into table manager.
     async fn get_or_create_table(&mut self) -> IcebergResult<()> {
+        let _guard = ProfileGuard::new(&format!(
+            "ICEBERG_MGR_get_or_create_table_{}_{}",
+            self.config.namespace.join("."),
+            self.config.table_name
+        ));
         if self.iceberg_table.is_none() {
-            let table = catalog_utils::get_or_create_iceberg_table(
-                &*self.catalog,
-                &self.config.warehouse_uri,
-                &self.config.namespace,
-                &self.config.table_name.clone(),
-                self.config.mooncake_table_schema.as_ref(),
-            )
-            .await?;
+            // catalog_utils::get_or_create_iceberg_table involves async catalog operations.
+            let table = {
+                let _actual_get_create_guard = ProfileGuard::new(&format!(
+                    "ICEBERG_MGR_get_or_create_table_actual_call_{}_{}",
+                    self.config.namespace.join("."),
+                    self.config.table_name
+                ));
+                catalog_utils::get_or_create_iceberg_table(
+                    &*self.catalog,
+                    &self.config.warehouse_uri,
+                    &self.config.namespace,
+                    &self.config.table_name.clone(),
+                    self.config.mooncake_table_schema.as_ref(),
+                )
+                .await?
+            };
             self.iceberg_table = Some(table);
         }
         Ok(())
     }
 
-    /// Write deletion vector to puffin file.
     async fn write_deletion_vector(
         &mut self,
         data_file: String,
         deletion_vector: BatchDeletionVector,
     ) -> IcebergResult<()> {
+        let _guard = ProfileGuard::new(&format!(
+            "ICEBERG_MGR_write_deletion_vector_for_data_file_{}",
+            data_file
+        ));
         let deleted_rows = deletion_vector.collect_deleted_rows();
         if deleted_rows.is_empty() {
             return Ok(());
         }
 
         if !deleted_rows.is_empty() {
-            // TODO(hjiang): Currently one deletion vector is stored in one puffin file, need to revisit later.
             let deleted_row_count = deleted_rows.len();
             let mut iceberg_deletion_vector = DeletionVector::new();
             iceberg_deletion_vector.mark_rows_deleted(deleted_rows);
@@ -152,38 +158,49 @@ impl IcebergTableManager {
                 blob_properties,
             );
 
-            // TODO(hjiang): Current iceberg-rust doesn't support deletion vector officially, so we do our own hack to rewrite manifest file by our own catalog implementation.
             let location_generator = DefaultLocationGenerator::new(
                 self.iceberg_table.as_ref().unwrap().metadata().clone(),
             )?;
             let puffin_filepath =
                 location_generator.generate_location(&format!("{}-puffin.bin", Uuid::new_v4()));
-            let mut puffin_writer = puffin_utils::create_puffin_writer(
-                self.iceberg_table.as_ref().unwrap().file_io(),
-                puffin_filepath.clone(),
-            )
-            .await?;
-            // TODO(hjiang): Provide option to enable compression for puffin blob.
-            puffin_writer.add(blob, CompressionCodec::None).await?;
 
-            self.catalog
-                .record_puffin_metadata_and_close(puffin_filepath, puffin_writer)
-                .await?;
+            let mut puffin_writer = {
+                let _create_puffin_writer_guard =
+                    ProfileGuard::new("ICEBERG_MGR_write_dv_create_puffin_writer");
+                puffin_utils::create_puffin_writer(
+                    self.iceberg_table.as_ref().unwrap().file_io(),
+                    puffin_filepath.clone(),
+                )
+                .await?
+            };
+            {
+                let _puffin_add_blob_guard =
+                    ProfileGuard::new("ICEBERG_MGR_write_dv_puffin_add_blob");
+                puffin_writer.add(blob, CompressionCodec::None).await?;
+            }
+            {
+                let _puffin_record_close_guard =
+                    ProfileGuard::new("ICEBERG_MGR_write_dv_puffin_record_and_close");
+                self.catalog
+                    .record_puffin_metadata_and_close(puffin_filepath, puffin_writer)
+                    .await?;
+            }
         }
-
         Ok(())
     }
 
-    /// Load data file into table manager from the current manifest entry.
     async fn load_data_file_from_manifest_entry(
         &mut self,
         entry: &ManifestEntry,
     ) -> IcebergResult<()> {
+        let _guard = ProfileGuard::new(&format!(
+            "ICEBERG_MGR_load_data_file_from_manifest_entry_{}",
+            entry.data_file().file_path()
+        ));
         let data_file = entry.data_file();
         if data_file.file_format() == DataFileFormat::Puffin {
             return Ok(());
         }
-
         let file_path = PathBuf::from(data_file.file_path().to_string());
         assert_eq!(
             data_file.file_format(),
@@ -200,17 +217,19 @@ impl IcebergTableManager {
         Ok(())
     }
 
-    /// Load deletion vector into table manager from the current manifest entry.
     async fn load_deletion_vector_from_manifest_entry(
         &mut self,
         entry: &ManifestEntry,
         file_io: &FileIO,
     ) -> IcebergResult<()> {
+        let _guard = ProfileGuard::new(&format!(
+            "ICEBERG_MGR_load_deletion_vector_from_manifest_entry_{}",
+            entry.data_file().file_path()
+        ));
         let data_file = entry.data_file();
         if data_file.file_format() == DataFileFormat::Parquet {
             return Ok(());
         }
-
         let referenced_path_buf: PathBuf = data_file.referenced_data_file().unwrap().into();
         let data_file_entry = self.persisted_items.get_mut(&referenced_path_buf);
         assert!(
@@ -218,133 +237,182 @@ impl IcebergTableManager {
             "At recovery, the data file path for {:?} doesn't exist",
             referenced_path_buf
         );
-
         IcebergValidation::validate_puffin_manifest_entry(entry)?;
-        let deletion_vector = DeletionVector::load_from_dv_blob(file_io.clone(), data_file).await?;
+        // DeletionVector::load_from_dv_blob involves async I/O to read the Puffin file.
+        let deletion_vector = {
+            let _load_dv_blob_guard = ProfileGuard::new("ICEBERG_MGR_load_dv_from_blob");
+            DeletionVector::load_from_dv_blob(file_io.clone(), data_file).await?
+        };
         let batch_deletion_vector = deletion_vector.take_as_batch_delete_vector();
         data_file_entry.unwrap().deletion_vector = batch_deletion_vector;
-
         Ok(())
     }
 }
 
-/// TODO(hjiang): Parallelize all IO operations.
 impl IcebergOperation for IcebergTableManager {
     async fn sync_snapshot(
         &mut self,
         mut disk_files: HashMap<PathBuf, BatchDeletionVector>,
     ) -> IcebergResult<()> {
-        // Initialize iceberg table on access.
-        self.get_or_create_table().await?;
+        let _guard = ProfileGuard::new(&format!(
+            "ICEBERG_MGR_sync_snapshot_table_{}_{}_files_{}",
+            self.config.namespace.join("."),
+            self.config.table_name,
+            disk_files.len()
+        ));
+        self.get_or_create_table().await?; // Profiled internally
 
         let mut new_data_files = vec![];
         let mut new_persisted_items: HashMap<PathBuf, DataFileEntry> = HashMap::new();
         let old_persisted_items = self.persisted_items.clone();
-        for (local_path, deletion_vector) in disk_files.drain() {
-            match old_persisted_items.get(&local_path) {
-                Some(entry) => {
-                    if entry.deletion_vector == deletion_vector {
+        // This loop iterates over disk files from MooncakeTable.
+        {
+            let _disk_file_processing_loop_guard = ProfileGuard::new(&format!(
+                "ICEBERG_MGR_sync_snapshot_process_disk_files_loop_count_{}",
+                disk_files.len()
+            ));
+            for (local_path, deletion_vector) in disk_files.drain() {
+                let _process_one_file_guard = ProfileGuard::new(&format!(
+                    "ICEBERG_MGR_sync_snapshot_process_one_disk_file_{:?}",
+                    local_path
+                ));
+                match old_persisted_items.get(&local_path) {
+                    Some(entry) => {
+                        if entry.deletion_vector == deletion_vector {
+                            let mut new_data_file_entry: DataFileEntry = entry.clone();
+                            new_data_file_entry.deletion_vector = deletion_vector;
+                            new_persisted_items.insert(local_path, new_data_file_entry);
+                            continue;
+                        }
+                        let path_str = entry.data_file.file_path().to_string();
+                        // self.write_deletion_vector is profiled internally.
+                        self.write_deletion_vector(path_str, deletion_vector.clone())
+                            .await?;
                         let mut new_data_file_entry: DataFileEntry = entry.clone();
                         new_data_file_entry.deletion_vector = deletion_vector;
                         new_persisted_items.insert(local_path, new_data_file_entry);
-                        continue;
                     }
-                    let path_str = entry.data_file.file_path().to_string();
-                    self.write_deletion_vector(path_str, deletion_vector.clone())
-                        .await?;
-
-                    let mut new_data_file_entry: DataFileEntry = entry.clone();
-                    new_data_file_entry.deletion_vector = deletion_vector;
-                    new_persisted_items.insert(local_path, new_data_file_entry);
-                }
-                None => {
-                    let data_file = catalog_utils::write_record_batch_to_iceberg(
-                        self.iceberg_table.as_ref().unwrap(),
-                        &local_path,
-                    )
-                    .await?;
-                    let data_filepath = data_file.file_path().to_string();
-                    new_data_files.push(data_file.clone());
-                    self.write_deletion_vector(data_filepath, deletion_vector.clone())
-                        .await?;
-                    new_persisted_items.insert(
-                        local_path,
-                        DataFileEntry {
-                            data_file,
-                            deletion_vector,
-                        },
-                    );
+                    None => {
+                        // catalog_utils::write_record_batch_to_iceberg involves async I/O (copying file).
+                        let data_file = {
+                            let _write_rb_iceberg_guard = ProfileGuard::new(
+                                "ICEBERG_MGR_sync_snapshot_write_record_batch_to_iceberg",
+                            );
+                            catalog_utils::write_record_batch_to_iceberg(
+                                self.iceberg_table.as_ref().unwrap(),
+                                &local_path,
+                            )
+                            .await?
+                        };
+                        let data_filepath = data_file.file_path().to_string();
+                        new_data_files.push(data_file.clone());
+                        // self.write_deletion_vector is profiled internally.
+                        self.write_deletion_vector(data_filepath, deletion_vector.clone())
+                            .await?;
+                        new_persisted_items.insert(
+                            local_path,
+                            DataFileEntry {
+                                data_file,
+                                deletion_vector,
+                            },
+                        );
+                    }
                 }
             }
         }
 
-        // If no change for both data files and deletion vectors, no need to initiate a new transaction.
         if self.persisted_items == new_persisted_items {
             return Ok(());
         }
         self.persisted_items = new_persisted_items;
 
-        // Only start append action when there're new data files.
         let mut txn = Transaction::new(self.iceberg_table.as_ref().unwrap());
         if !new_data_files.is_empty() {
+            // Transaction operations (fast_append, apply) are typically metadata ops.
+            let _txn_append_guard =
+                ProfileGuard::new("ICEBERG_MGR_sync_snapshot_txn_fast_append_apply");
             let mut action =
                 txn.fast_append(/*commit_uuid=*/ None, /*key_metadata=*/ vec![])?;
             action.add_data_files(new_data_files)?;
             txn = action.apply().await?;
         }
 
-        self.iceberg_table = Some(txn.commit(&*self.catalog).await?);
+        // txn.commit involves catalog interaction to write metadata files.
+        self.iceberg_table = Some({
+            let _txn_commit_guard = ProfileGuard::new("ICEBERG_MGR_sync_snapshot_txn_commit");
+            txn.commit(&*self.catalog).await?
+        });
         self.catalog.clear_puffin_metadata();
-
         Ok(())
     }
 
-    // TODO(hjiang): Write a macro to avoid verbose error mapping.
     async fn load_snapshot_from_table(&mut self) -> IcebergResult<()> {
+        let _guard = ProfileGuard::new(&format!(
+            "ICEBERG_MGR_load_snapshot_from_table_{}_{}",
+            self.config.namespace.join("."),
+            self.config.table_name
+        ));
         if self.iceberg_table.is_some() {
             return Ok(());
         }
-        self.get_or_create_table().await?;
+        self.get_or_create_table().await?; // Profiled internally
         let table_metadata = self.iceberg_table.as_ref().unwrap().metadata();
-
-        // There's nothing stored in iceberg table (aka, first time initialization).
         if table_metadata.current_snapshot().is_none() {
             return Ok(());
         }
-
-        // Load table state into iceberg table manager.
         let snapshot_meta = table_metadata.current_snapshot().unwrap();
-        let manifest_list = snapshot_meta
-            .load_manifest_list(
-                self.iceberg_table.as_ref().unwrap().file_io(),
-                table_metadata,
-            )
-            .await?;
-
+        // snapshot_meta.load_manifest_list involves async I/O.
+        let manifest_list = {
+            let _load_manifest_list_guard =
+                ProfileGuard::new("ICEBERG_MGR_load_snapshot_load_manifest_list");
+            snapshot_meta
+                .load_manifest_list(
+                    self.iceberg_table.as_ref().unwrap().file_io(),
+                    table_metadata,
+                )
+                .await?
+        };
         let file_io = self.iceberg_table.as_ref().unwrap().file_io().clone();
-        for manifest_file in manifest_list.entries().iter() {
-            // All files (i.e. data files, deletion vector, manifest files) under the same snapshot are assigned with the same sequence number.
-            // Reference: https://iceberg.apache.org/spec/?h=content#sequence-numbers
-            let manifest = manifest_file.load_manifest(&file_io).await?;
-            let (manifest_entries, _) = manifest.into_parts();
-            let snapshot_seq_no = manifest_entries.first().unwrap().sequence_number();
-            for entry in manifest_entries.into_iter() {
-                // Sanity check all manifest entries are of the sequence number.
-                let cur_entry_seq_no = entry.sequence_number();
-                if snapshot_seq_no != cur_entry_seq_no {
-                    return Err(IcebergError::new(
-                        iceberg::ErrorKind::DataInvalid,
-                        format!("When reading from iceberg table, snapshot sequence id inconsistency found {:?} vs {:?}", snapshot_seq_no, cur_entry_seq_no),
+        // This loop processes manifest files.
+        {
+            let _manifest_processing_loop_guard = ProfileGuard::new(&format!(
+                "ICEBERG_MGR_load_snapshot_process_manifests_loop_count_{}",
+                manifest_list.entries().len()
+            ));
+            for manifest_file in manifest_list.entries().iter() {
+                let _process_one_manifest_guard =
+                    ProfileGuard::new("ICEBERG_MGR_load_snapshot_process_one_manifest");
+                // manifest_file.load_manifest involves async I/O.
+                let manifest = {
+                    let _load_manifest_guard =
+                        ProfileGuard::new("ICEBERG_MGR_load_snapshot_load_one_manifest_file");
+                    manifest_file.load_manifest(&file_io).await?
+                };
+                let (manifest_entries, _) = manifest.into_parts();
+                let snapshot_seq_no = manifest_entries.first().unwrap().sequence_number();
+                // This loop processes entries within a manifest.
+                {
+                    let _entry_processing_loop_guard = ProfileGuard::new(&format!(
+                        "ICEBERG_MGR_load_snapshot_process_manifest_entries_loop_count_{}",
+                        manifest_entries.len()
                     ));
+                    for entry in manifest_entries.into_iter() {
+                        let cur_entry_seq_no = entry.sequence_number();
+                        if snapshot_seq_no != cur_entry_seq_no {
+                            return Err(IcebergError::new(
+                                iceberg::ErrorKind::DataInvalid,
+                                format!("When reading from iceberg table, snapshot sequence id inconsistency found {:?} vs {:?}", snapshot_seq_no, cur_entry_seq_no),
+                            ));
+                        }
+                        // These are profiled internally.
+                        self.load_data_file_from_manifest_entry(entry.as_ref())
+                            .await?;
+                        self.load_deletion_vector_from_manifest_entry(entry.as_ref(), &file_io)
+                            .await?;
+                    }
                 }
-                // On load, we do two pass on all entries, to check whether all deletion vector has a corresponding data file.
-                self.load_data_file_from_manifest_entry(entry.as_ref())
-                    .await?;
-                self.load_deletion_vector_from_manifest_entry(entry.as_ref(), &file_io)
-                    .await?;
             }
         }
-
         Ok(())
     }
 }

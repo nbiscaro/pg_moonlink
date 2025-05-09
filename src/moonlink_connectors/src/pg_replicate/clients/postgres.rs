@@ -10,7 +10,9 @@ use tokio_postgres::{
 };
 use tracing::{info, warn};
 
+// Assuming ProfileGuard is in src/profiling.rs
 use crate::pg_replicate::table::{ColumnSchema, LookupKey, TableId, TableName, TableSchema};
+use crate::profiling::ProfileGuard;
 
 pub struct SlotInfo {
     pub confirmed_flush_lsn: PgLsn,
@@ -58,6 +60,7 @@ pub enum ReplicationClientError {
 impl ReplicationClient {
     /// Connect to a postgres database in logical replication mode without TLS
     pub async fn connect_no_tls(uri: &str) -> Result<ReplicationClient, ReplicationClientError> {
+        let _guard = ProfileGuard::new("REPL_CLIENT_connect_no_tls");
         info!("connecting to postgres");
 
         let mut config = uri.parse::<Config>()?;
@@ -65,6 +68,8 @@ impl ReplicationClient {
         let (postgres_client, connection) = config.connect(NoTls).await?;
 
         tokio::spawn(async move {
+            // This task is background, so we won't profile its entire lifetime,
+            // but its start is part of the connect_no_tls process.
             info!("waiting for connection to terminate");
             if let Err(e) = connection.await {
                 warn!("connection error: {}", e);
@@ -81,6 +86,7 @@ impl ReplicationClient {
 
     /// Starts a read-only trasaction with repeatable read isolation level
     pub async fn begin_readonly_transaction(&mut self) -> Result<(), ReplicationClientError> {
+        let _guard = ProfileGuard::new("REPL_CLIENT_begin_readonly_transaction");
         self.postgres_client
             .simple_query("abort; begin read only isolation level repeatable read;")
             .await?;
@@ -90,6 +96,7 @@ impl ReplicationClient {
 
     /// Commits a transaction
     pub async fn commit_txn(&mut self) -> Result<(), ReplicationClientError> {
+        let _guard = ProfileGuard::new("REPL_CLIENT_commit_txn");
         if self.in_txn {
             self.postgres_client.simple_query("commit;").await?;
             self.in_txn = false;
@@ -98,6 +105,7 @@ impl ReplicationClient {
     }
 
     async fn rollback_txn(&mut self) -> Result<(), ReplicationClientError> {
+        let _guard = ProfileGuard::new("REPL_CLIENT_rollback_txn");
         if self.in_txn {
             self.postgres_client.simple_query("rollback;").await?;
             self.in_txn = false;
@@ -111,6 +119,10 @@ impl ReplicationClient {
         table_name: &TableName,
         column_schemas: &[ColumnSchema],
     ) -> Result<CopyOutStream, ReplicationClientError> {
+        let _guard = ProfileGuard::new_with_prefix(
+            "REPL_CLIENT_get_table_copy_stream",
+            &table_name.to_string(),
+        );
         let column_list = column_schemas
             .iter()
             .map(|col| quote_identifier(&col.name))
@@ -133,7 +145,15 @@ impl ReplicationClient {
         table_id: TableId,
         publication: Option<&str>,
     ) -> Result<Vec<ColumnSchema>, ReplicationClientError> {
-        let (pub_cte, pub_pred) = if let Some(publication) = publication {
+        let tag = format!(
+            "REPL_CLIENT_get_column_schemas_table_{}_pub_{}",
+            table_id,
+            publication.unwrap_or("none")
+        );
+        let _guard = ProfileGuard::new(&tag);
+
+        let (pub_cte, pub_pred) = if let Some(publication_name) = publication {
+            // Renamed to avoid conflict with outer var
             (
                 format!(
                     "with pub_attrs as (
@@ -143,7 +163,7 @@ impl ReplicationClient {
                         where p.pubname = {}
                         and r.prrelid = {}
                     )",
-                    quote_literal(publication),
+                    quote_literal(publication_name), // Use renamed var
                     table_id
                 ),
                 "and (
@@ -181,63 +201,73 @@ impl ReplicationClient {
 
         let mut column_schemas = vec![];
 
-        for message in self
-            .postgres_client
-            .simple_query(&column_info_query)
-            .await?
+        // Profile the query execution itself
+        let query_rows = {
+            let _query_guard = ProfileGuard::new(&format!("{}_query_exec", tag));
+            self.postgres_client
+                .simple_query(&column_info_query)
+                .await?
+        };
+
+        // Profile row processing
+        // This might be too granular if there are many rows and processing is trivial.
+        // If row processing itself is suspected to be slow, this is useful.
+        // Otherwise, the overall function timing might be enough.
+        // For now, let's keep it to see.
         {
-            if let SimpleQueryMessage::Row(row) = message {
-                let name = row
-                    .try_get("attname")?
-                    .ok_or(ReplicationClientError::MissingColumn(
-                        "attname".to_string(),
-                        "pg_attribute".to_string(),
-                    ))?
-                    .to_string();
-
-                let type_oid = row
-                    .try_get("atttypid")?
-                    .ok_or(ReplicationClientError::MissingColumn(
-                        "atttypid".to_string(),
-                        "pg_attribute".to_string(),
-                    ))?
-                    .parse()
-                    .map_err(|_| ReplicationClientError::OidColumnNotU32)?;
-
-                //TODO: For now we assume all types are simple, fix it later
-                let typ = Type::from_oid(type_oid).unwrap_or(Type::new(
-                    format!("unnamed(oid: {type_oid})"),
-                    type_oid,
-                    Kind::Simple,
-                    "pg_catalog".to_string(),
-                ));
-
-                let modifier = row
-                    .try_get("atttypmod")?
-                    .ok_or(ReplicationClientError::MissingColumn(
-                        "atttypmod".to_string(),
-                        "pg_attribute".to_string(),
-                    ))?
-                    .parse()
-                    .map_err(|_| ReplicationClientError::TypeModifierColumnNotI32)?;
-
-                let nullable =
-                    row.try_get("attnotnull")?
+            let _processing_guard = ProfileGuard::new(&format!("{}_row_processing", tag));
+            for message in query_rows {
+                if let SimpleQueryMessage::Row(row) = message {
+                    let name = row
+                        .try_get("attname")?
                         .ok_or(ReplicationClientError::MissingColumn(
-                            "attnotnull".to_string(),
+                            "attname".to_string(),
                             "pg_attribute".to_string(),
                         ))?
-                        == "f";
+                        .to_string();
 
-                column_schemas.push(ColumnSchema {
-                    name,
-                    typ,
-                    modifier,
-                    nullable,
-                })
+                    let type_oid = row
+                        .try_get("atttypid")?
+                        .ok_or(ReplicationClientError::MissingColumn(
+                            "atttypid".to_string(),
+                            "pg_attribute".to_string(),
+                        ))?
+                        .parse()
+                        .map_err(|_| ReplicationClientError::OidColumnNotU32)?;
+
+                    let typ = Type::from_oid(type_oid).unwrap_or(Type::new(
+                        format!("unnamed(oid: {type_oid})"),
+                        type_oid,
+                        Kind::Simple,
+                        "pg_catalog".to_string(),
+                    ));
+
+                    let modifier = row
+                        .try_get("atttypmod")?
+                        .ok_or(ReplicationClientError::MissingColumn(
+                            "atttypmod".to_string(),
+                            "pg_attribute".to_string(),
+                        ))?
+                        .parse()
+                        .map_err(|_| ReplicationClientError::TypeModifierColumnNotI32)?;
+
+                    let nullable =
+                        row.try_get("attnotnull")?
+                            .ok_or(ReplicationClientError::MissingColumn(
+                                "attnotnull".to_string(),
+                                "pg_attribute".to_string(),
+                            ))?
+                            == "f";
+
+                    column_schemas.push(ColumnSchema {
+                        name,
+                        typ,
+                        modifier,
+                        nullable,
+                    })
+                }
             }
         }
-
         Ok(column_schemas)
     }
 
@@ -246,6 +276,11 @@ impl ReplicationClient {
         table_id: TableId,
         published_column_names: HashSet<String>,
     ) -> Result<Option<LookupKey>, ReplicationClientError> {
+        let _guard = ProfileGuard::new_with_prefix(
+            "REPL_CLIENT_fetch_lookup_key_table",
+            &table_id.to_string(),
+        );
+
         let index_rows = self.fetch_index_rows(table_id).await?;
 
         for index_row in index_rows {
@@ -259,6 +294,8 @@ impl ReplicationClient {
                 None => continue,
             };
 
+            // Potentially profile this call if it becomes a bottleneck inside the loop
+            // let _col_info_guard = ProfileGuard::new(&format!("REPL_CLIENT_fetch_lookup_key_table_{}_index_{}_fetch_cols", table_id, index_name));
             let column_infos = self.fetch_index_columns(table_id, indkey).await?;
 
             let mut columns = Vec::new();
@@ -285,13 +322,14 @@ impl ReplicationClient {
         Ok(None)
     }
 
-    /// Finds a valid index for lookup key
-    /// must be unique, not partial, not deferrable, and include only columns marked NOT NULL.
-    /// Follows same definition as PG replica identity [https://www.postgresql.org/docs/current/sql-altertable.html#SQL-ALTERTABLE-REPLICA-IDENTITY]
     async fn fetch_index_rows(
         &self,
         table_id: TableId,
     ) -> Result<Vec<SimpleQueryRow>, ReplicationClientError> {
+        let _guard = ProfileGuard::new_with_prefix(
+            "REPL_CLIENT_fetch_index_rows_table",
+            &table_id.to_string(),
+        );
         let query = format!(
             "
             SELECT
@@ -330,6 +368,10 @@ impl ReplicationClient {
         table_id: TableId,
         indkey: &str,
     ) -> Result<Vec<(String, bool)>, ReplicationClientError> {
+        let _guard = ProfileGuard::new(&format!(
+            "REPL_CLIENT_fetch_index_columns_table_{}_indkey_{}",
+            table_id, indkey
+        ));
         let query = format!(
             "
             SELECT a.attname, a.attnotnull
@@ -361,13 +403,16 @@ impl ReplicationClient {
         table_id: TableId,
         column_schemas: &Vec<ColumnSchema>,
     ) -> Result<LookupKey, ReplicationClientError> {
+        let _guard = ProfileGuard::new_with_prefix(
+            "REPL_CLIENT_get_lookup_key_table",
+            &table_id.to_string(),
+        );
         let column_names: HashSet<String> =
             column_schemas.iter().map(|cs| cs.name.clone()).collect();
         if let Some(unique_index_key) = self.fetch_lookup_key(table_id, column_names).await? {
             return Ok(unique_index_key);
         }
 
-        // default to full row
         Ok(LookupKey::FullRow)
     }
 
@@ -376,9 +421,15 @@ impl ReplicationClient {
         table_names: &[TableName],
         publication: Option<&str>,
     ) -> Result<HashMap<TableId, TableSchema>, ReplicationClientError> {
+        let _guard = ProfileGuard::new(&format!(
+            "REPL_CLIENT_get_table_schemas_count_{}_pub_{}",
+            table_names.len(),
+            publication.unwrap_or("none")
+        ));
         let mut table_schemas = HashMap::new();
 
         for table_name in table_names {
+            // get_table_schema is profiled internally
             let table_schema = self
                 .get_table_schema(table_name.clone(), publication)
                 .await?;
@@ -393,13 +444,17 @@ impl ReplicationClient {
         table_name: TableName,
         publication: Option<&str>,
     ) -> Result<TableSchema, ReplicationClientError> {
+        let _guard = ProfileGuard::new_with_prefix(
+            "REPL_CLIENT_get_table_schema_table",
+            &table_name.to_string(),
+        );
         let table_id = self
-            .get_table_id(&table_name)
+            .get_table_id(&table_name) // profiled internally
             .await?
             .ok_or(ReplicationClientError::MissingTable(table_name.clone()))?;
 
-        let column_schemas = self.get_column_schemas(table_id, publication).await?;
-        let lookup_key = self.get_lookup_key(table_id, &column_schemas).await?;
+        let column_schemas = self.get_column_schemas(table_id, publication).await?; // profiled internally
+        let lookup_key = self.get_lookup_key(table_id, &column_schemas).await?; // profiled internally
 
         let table_schema = TableSchema {
             table_name,
@@ -410,13 +465,12 @@ impl ReplicationClient {
         Ok(table_schema)
     }
 
-    /// Returns the table id (called relation id in Postgres) of a table
-    /// Also checks whether the replica identity is default or full and
-    /// returns an error if not.
     pub async fn get_table_id(
         &self,
         table: &TableName,
     ) -> Result<Option<TableId>, ReplicationClientError> {
+        let _guard =
+            ProfileGuard::new_with_prefix("REPL_CLIENT_get_table_id_table", &table.to_string());
         let quoted_schema = quote_literal(&table.schema);
         let quoted_name = quote_literal(&table.name);
 
@@ -432,7 +486,15 @@ impl ReplicationClient {
             quoted_schema, quoted_name
         );
 
-        for message in self.postgres_client.simple_query(&table_info_query).await? {
+        let query_result = {
+            let _query_guard = ProfileGuard::new(&format!(
+                "REPL_CLIENT_get_table_id_table_{}_query_exec",
+                table.to_string()
+            ));
+            self.postgres_client.simple_query(&table_info_query).await?
+        };
+
+        for message in query_result {
             if let SimpleQueryMessage::Row(row) = message {
                 let replica_identity =
                     row.try_get("relreplident")?
@@ -462,9 +524,8 @@ impl ReplicationClient {
         Ok(None)
     }
 
-    /// Returns the slot info of an existing slot. The slot info currently only has the
-    /// confirmed_flush_lsn column of the pg_replication_slots table.
     async fn get_slot(&self, slot_name: &str) -> Result<Option<SlotInfo>, ReplicationClientError> {
+        let _guard = ProfileGuard::new_with_prefix("REPL_CLIENT_get_slot", slot_name);
         let query = format!(
             r#"select confirmed_flush_lsn from pg_replication_slots where slot_name = {};"#,
             quote_literal(slot_name)
@@ -492,12 +553,8 @@ impl ReplicationClient {
         Ok(None)
     }
 
-    /// Creates a logical replication slot. This will only succeed if the postgres connection
-    /// is in logical replication mode. Otherwise it will fail with the following error:
-    /// `syntax error at or near "CREATE_REPLICATION_SLOT"``
-    ///
-    /// Returns the consistent_point column as slot info.
     async fn create_slot(&self, slot_name: &str) -> Result<SlotInfo, ReplicationClientError> {
+        let _guard = ProfileGuard::new_with_prefix("REPL_CLIENT_create_slot", slot_name);
         let query = format!(
             r#"CREATE_REPLICATION_SLOT {} LOGICAL pgoutput USE_SNAPSHOT"#,
             quote_identifier(slot_name)
@@ -522,37 +579,46 @@ impl ReplicationClient {
         Err(ReplicationClientError::FailedToCreateSlot)
     }
 
-    /// Either return the slot info of an existing slot or creates a new
-    /// slot and returns its slot info.
     pub async fn get_or_create_slot(
         &mut self,
         slot_name: &str,
     ) -> Result<SlotInfo, ReplicationClientError> {
+        let _guard = ProfileGuard::new_with_prefix("REPL_CLIENT_get_or_create_slot", slot_name);
+        // get_slot and create_slot are profiled internally
         if let Some(slot_info) = self.get_slot(slot_name).await? {
             Ok(slot_info)
         } else {
-            self.rollback_txn().await?;
-            self.begin_readonly_transaction().await?;
-            Ok(self.create_slot(slot_name).await?)
+            self.rollback_txn().await?; // profiled internally
+            self.begin_readonly_transaction().await?; // profiled internally
+            Ok(self.create_slot(slot_name).await?) // profiled internally
         }
     }
 
-    /// Returns all table names in a publication
     pub async fn get_publication_table_names(
         &self,
         publication: &str,
     ) -> Result<Vec<TableName>, ReplicationClientError> {
+        let _guard = ProfileGuard::new_with_prefix(
+            "REPL_CLIENT_get_publication_table_names_pub",
+            publication,
+        );
         let publication_query = format!(
             "select schemaname, tablename from pg_publication_tables where pubname = {};",
             quote_literal(publication)
         );
 
         let mut table_names = vec![];
-        for msg in self
-            .postgres_client
-            .simple_query(&publication_query)
-            .await?
-        {
+        let query_result = {
+            let _query_guard = ProfileGuard::new(&format!(
+                "REPL_CLIENT_get_publication_table_names_pub_{}_query_exec",
+                publication
+            ));
+            self.postgres_client
+                .simple_query(&publication_query)
+                .await?
+        };
+
+        for msg in query_result {
             if let SimpleQueryMessage::Row(row) = msg {
                 let schema = row
                     .get(0)
@@ -581,6 +647,8 @@ impl ReplicationClient {
         &self,
         publication: &str,
     ) -> Result<bool, ReplicationClientError> {
+        let _guard =
+            ProfileGuard::new_with_prefix("REPL_CLIENT_publication_exists_pub", publication);
         let publication_exists_query = format!(
             "select 1 as exists from pg_publication where pubname = {};",
             quote_literal(publication)
@@ -603,6 +671,11 @@ impl ReplicationClient {
         slot_name: &str,
         start_lsn: PgLsn,
     ) -> Result<LogicalReplicationStream, ReplicationClientError> {
+        let _guard = ProfileGuard::new(&format!(
+            "REPL_CLIENT_get_logical_replication_stream_pub_{}_slot_{}",
+            publication, slot_name
+        ));
+
         let options = format!(
             r#"("proto_version" '2', "publication_names" {}, "streaming" 'on')"#,
             quote_literal(publication),
@@ -615,12 +688,18 @@ impl ReplicationClient {
             options
         );
 
-        let copy_stream = self
-            .postgres_client
-            .copy_both_simple::<bytes::Bytes>(&query)
-            .await?;
+        // This is a copy_both_simple, which is a more complex interaction than simple_query
+        let copy_stream_future = {
+            let _copy_guard = ProfileGuard::new(&format!(
+                "REPL_CLIENT_get_logical_replication_stream_pub_{}_slot_{}_copy_both_simple",
+                publication, slot_name
+            ));
+            self.postgres_client
+                .copy_both_simple::<bytes::Bytes>(&query)
+                .await?
+        };
 
-        let stream = LogicalReplicationStream::new(copy_stream, Some(2));
+        let stream = LogicalReplicationStream::new(copy_stream_future, Some(2));
 
         Ok(stream)
     }
