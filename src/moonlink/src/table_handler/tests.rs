@@ -331,3 +331,48 @@ async fn test_stream_delete_from_main_disk_row() {
 
     env.shutdown().await;
 }
+
+#[tokio::test]
+async fn test_streaming_transaction_periodic_flush_then_abort() {
+    let mut env = TestEnvironment::new();
+    let baseline_xact_id = 500; // For baseline data
+    let baseline_commit_lsn = 50;
+    let aborted_xact_id = 501;
+    // LSN for reads after abort; should reflect only committed data up to baseline_commit_lsn
+    let read_lsn_after_abort = baseline_commit_lsn + 5;
+
+    // --- Phase 1: Setup - Commit baseline data ---
+    env.append_row(1, "BaselineUser", 30, Some(baseline_xact_id))
+        .await;
+    env.stream_commit(baseline_commit_lsn, baseline_xact_id)
+        .await;
+    env.set_table_commit_lsn(baseline_commit_lsn); // ReadStateManager knows LSN 50 is committed
+    env.set_replication_lsn(read_lsn_after_abort);
+    env.verify_snapshot(baseline_commit_lsn, &[1]).await;
+
+    // --- Phase 3: Append Row A (ID:10) and periodically flush it ---
+    env.append_row(10, "UserA-ToAbort-Flushed", 25, Some(aborted_xact_id))
+        .await;
+    env.stream_flush(aborted_xact_id).await; // Row A now in a xact-specific disk slice, uncommitted
+
+    // --- Phase 4: Append Row B (ID:11) (stays in stream's mem-slice) ---
+    env.append_row(11, "UserB-ToAbort-Mem", 35, Some(aborted_xact_id))
+        .await;
+
+    // --- Phase 5: Attempt to delete baseline Row (ID:1) within the aborted transaction ---
+    env.delete_row(1, "BaselineUser", 30, 0, Some(aborted_xact_id))
+        .await; // LSN placeholder
+
+    // --- Phase 6: Abort the streaming transaction ---
+    // This should discard TransactionStreamState for aborted_xact_id, including:
+    // - The DiskSliceWriter containing Row A (ID:10).
+    // - The MemSlice containing Row B (ID:11).
+    // - The RawDeletionRecord for Row (ID:1).
+    env.stream_abort(aborted_xact_id).await;
+
+    // --- Phase 7: Verify state after abort ---
+    // Effective read LSN = min(target=55, table_commit=50, replication=55) = 50
+    env.verify_snapshot(read_lsn_after_abort, &[1]).await;
+
+    env.shutdown().await;
+}
