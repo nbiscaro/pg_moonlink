@@ -142,6 +142,7 @@ impl SnapshotTask {
 struct TransactionStreamState {
     mem_slice: MemSlice,
     new_deletions: Vec<RawDeletionRecord>,
+    new_disk_slices: Vec<DiskSliceWriter>,
 }
 
 impl TransactionStreamState {
@@ -149,6 +150,7 @@ impl TransactionStreamState {
         Self {
             mem_slice: MemSlice::new(schema, batch_size),
             new_deletions: Vec::new(),
+            new_disk_slices: Vec::new(),
         }
     }
 }
@@ -266,6 +268,15 @@ impl MooncakeTable {
         })
     }
 
+    pub fn should_transaction_flush(&self, xact_id: u32) -> bool {
+        self.transaction_stream_states
+            .get(&xact_id)
+            .unwrap()
+            .mem_slice
+            .get_num_rows()
+            >= self.metadata.config.batch_size
+    }
+
     pub fn append_in_stream_batch(&mut self, row: MoonlinkRow, xact_id: u32) -> Result<()> {
         let lookup_key = self.metadata.identity.get_lookup_key(&row);
         let stream_state = Self::get_or_create_stream_state(
@@ -293,11 +304,12 @@ impl MooncakeTable {
             &self.metadata,
             xact_id,
         );
-        let pos = stream_state
+        if let Some(pos) = stream_state
             .mem_slice
-            .delete(&record, &self.metadata.identity);
-        record.pos = pos;
-        if pos.is_none() {
+            .delete(&record, &self.metadata.identity)
+        {
+            record.pos = Some(pos);
+        } else {
             // Edge‑case: txn deletes a row that's still in the main mem_slice
             // TODO(nbiscaro): This is a bit of a hack. We can likely resolve this in a cleaner way during snapshot.
             // [https://github.com/Mooncake-Labs/moonlink/issues/126]
@@ -329,7 +341,7 @@ impl MooncakeTable {
         mem_slice: &mut MemSlice,
         snapshot_task: &mut SnapshotTask,
         metadata: &Arc<TableMetadata>,
-        lsn: u64,
+        lsn: Option<u64>,
     ) -> Result<DiskSliceWriter> {
         // Finalize the current batch (if needed)
         let (new_batch, batches, index) = mem_slice.drain().unwrap();
@@ -353,7 +365,39 @@ impl MooncakeTable {
         Ok(disk_slice)
     }
 
-    pub async fn flush_transaction_stream(&mut self, xact_id: u32, lsn: u64) -> Result<()> {
+    async fn stream_flush(
+        mem_slice: &mut MemSlice,
+        metadata: &Arc<TableMetadata>,
+    ) -> Result<DiskSliceWriter> {
+        // Finalize the current batch (if needed)
+        let (_, batches, index) = mem_slice.drain().unwrap();
+
+        let index = Arc::new(index);
+        let mut disk_slice = DiskSliceWriter::new(
+            metadata.schema.clone(),
+            metadata.path.clone(),
+            batches,
+            None,
+            index,
+        );
+        // TODO(nbiscaro): Find longer term solution that allows aysnc write
+        disk_slice.write()?;
+        Ok(disk_slice)
+    }
+
+    pub async fn flush_transaction_stream(&mut self, xact_id: u32) -> Result<()> {
+        if let Some(stream_state) = self.transaction_stream_states.get_mut(&xact_id) {
+            let disk_slice =
+                Self::stream_flush(&mut stream_state.mem_slice, &self.metadata).await?;
+
+            stream_state.new_disk_slices.push(disk_slice);
+
+            return Ok(());
+        }
+        Ok(())
+    }
+
+    pub async fn commit_transaction_stream(&mut self, xact_id: u32, lsn: u64) -> Result<()> {
         if let Some(mut stream_state) = self.transaction_stream_states.remove(&xact_id) {
             let xact_mem_slice = &mut stream_state.mem_slice;
 
@@ -371,11 +415,19 @@ impl MooncakeTable {
                 .new_deletions
                 .append(&mut stream_state.new_deletions);
 
-            // flush the transaction and add disk slice to snapshot task
-            let disk_slice =
-                Self::inner_flush_data_files(xact_mem_slice, snapshot_task, &self.metadata, lsn)
-                    .await?;
-            self.next_snapshot_task.new_disk_slices.push(disk_slice);
+            // Flush any remaining rows in the xact mem slice
+            let disk_slice = Self::stream_flush(xact_mem_slice, &self.metadata).await?;
+            stream_state.new_disk_slices.push(disk_slice);
+
+            // Update the LSN of all disk slices from pre-commit flushes
+            for disk_slice in stream_state.new_disk_slices.iter_mut() {
+                disk_slice.set_lsn(Some(lsn));
+            }
+
+            // Add the disk slices to the snapshot task
+            snapshot_task
+                .new_disk_slices
+                .extend(stream_state.new_disk_slices.drain(..));
 
             Ok(())
         } else {
@@ -391,7 +443,7 @@ impl MooncakeTable {
             &mut self.mem_slice,
             &mut self.next_snapshot_task,
             &self.metadata,
-            lsn,
+            Some(lsn),
         )
         .await?;
         self.next_snapshot_task.new_disk_slices.push(disk_slice);
