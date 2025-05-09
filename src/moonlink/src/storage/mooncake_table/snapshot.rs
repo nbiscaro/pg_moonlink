@@ -146,9 +146,12 @@ impl SnapshotTableState {
 
             // remap deletions written *after* this slice’s LSN
             let write_lsn = slice.lsn();
-            let cut = self
-                .committed_deletion_log
-                .partition_point(|d| d.lsn <= write_lsn);
+            let cut = self.committed_deletion_log.partition_point(|d| {
+                d.lsn
+                    <= write_lsn.expect(
+                        "Critical: LSN is None after it should have been updated by commit process",
+                    )
+            });
 
             self.committed_deletion_log[cut..]
                 .iter_mut()

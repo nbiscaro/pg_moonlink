@@ -23,7 +23,7 @@ pub(crate) struct DiskSliceWriter {
     // input
     batches: Vec<BatchEntry>,
 
-    writer_lsn: u64,
+    writer_lsn: Option<u64>,
 
     old_index: Arc<MemIndex>,
 
@@ -49,7 +49,7 @@ impl DiskSliceWriter {
         schema: Arc<Schema>,
         dir_path: PathBuf,
         batches: Vec<BatchEntry>,
-        writer_lsn: u64,
+        writer_lsn: Option<u64>,
         old_index: Arc<MemIndex>,
     ) -> Self {
         Self {
@@ -90,8 +90,12 @@ impl DiskSliceWriter {
         Ok(())
     }
 
-    pub(super) fn lsn(&self) -> u64 {
+    pub(super) fn lsn(&self) -> Option<u64> {
         self.writer_lsn
+    }
+
+    pub(super) fn set_lsn(&mut self, lsn: Option<u64>) {
+        self.writer_lsn = lsn;
     }
 
     pub(super) fn input_batches(&self) -> &Vec<BatchEntry> {
@@ -251,7 +255,7 @@ mod tests {
             schema,
             temp_dir.path().to_path_buf(),
             entries,
-            1,
+            Some(1),
             Arc::new(old_index),
         );
         disk_slice.write()?;
@@ -354,7 +358,7 @@ mod tests {
             schema,
             temp_dir.path().to_path_buf(),
             entries,
-            1,
+            Some(1),
             Arc::new(index),
         );
 
