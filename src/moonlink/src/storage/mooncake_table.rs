@@ -427,7 +427,7 @@ impl MooncakeTable {
             // Add the disk slices to the snapshot task
             snapshot_task
                 .new_disk_slices
-                .extend(stream_state.new_disk_slices.drain(..));
+                .append(&mut stream_state.new_disk_slices);
 
             Ok(())
         } else {
