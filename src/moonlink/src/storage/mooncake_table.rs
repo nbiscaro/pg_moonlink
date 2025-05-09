@@ -383,16 +383,24 @@ impl MooncakeTable {
         let (_, batches, index) = mem_slice.drain().unwrap();
 
         let index = Arc::new(index);
-        let mut disk_slice = DiskSliceWriter::new(
-            metadata.schema.clone(),
-            metadata.path.clone(),
-            batches,
-            None,
-            index,
-        );
-        // TODO(nbiscaro): Find longer term solution that allows aysnc write
-        disk_slice.write()?;
-        Ok(disk_slice)
+
+        let schema_clone = metadata.schema.clone();
+        let path_clone = metadata.path.clone();
+
+        let disk_slice_join_handle = tokio::task::spawn_blocking(move || {
+            let mut disk_slice =
+                DiskSliceWriter::new(schema_clone, path_clone, batches, None, index);
+
+            disk_slice.write()?;
+
+            Ok(disk_slice) // Return the DiskSliceWriter on success.
+        });
+
+        match disk_slice_join_handle.await {
+            Ok(Ok(disk_slice)) => Ok(disk_slice),
+            Ok(Err(e)) => Err(e),
+            Err(join_error) => Err(Error::TokioJoinError(join_error.to_string())),
+        }
     }
 
     pub async fn flush_transaction_stream(&mut self, xact_id: u32) -> Result<()> {
