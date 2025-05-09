@@ -25,6 +25,8 @@ pub enum TableEvent {
     StreamAbort { xact_id: u32 },
     /// Flush the table to disk
     Flush { lsn: u64 },
+    /// Flush the transaction stream with given xact_id
+    StreamFlush { xact_id: u32 },
     /// Shutdown the handler
     _Shutdown,
 }
@@ -74,7 +76,16 @@ impl TableHandler {
                     match event {
                         TableEvent::Append { row, xact_id } => {
                             let result = match xact_id {
-                                Some(xact_id) => table.append_in_stream_batch(row, xact_id),
+                                Some(xact_id) => {
+                                    let res = table.append_in_stream_batch(row, xact_id);
+                                    if table.should_transaction_flush(xact_id) {
+                                        println!("Flushing transaction stream");
+                                        if let Err(e) = table.flush_transaction_stream(xact_id).await {
+                                            println!("Flush failed in Append: {}", e);
+                                        }
+                                    }
+                                    res
+                                },
                                 None => table.append(row),
                             };
 
@@ -97,7 +108,7 @@ impl TableHandler {
                             }
                         }
                         TableEvent::StreamCommit { lsn, xact_id } => {
-                            if let Err(e) = table.flush_transaction_stream(xact_id, lsn).await {
+                            if let Err(e) = table.commit_transaction_stream(xact_id, lsn).await {
                                 println!("Stream commit flush failed: {}", e);
                             }
                         }
@@ -107,6 +118,11 @@ impl TableHandler {
                         TableEvent::Flush { lsn } => {
                             if let Err(e) = table.flush(lsn).await {
                                 println!("Explicit Flush failed: {}", e);
+                            }
+                        }
+                        TableEvent::StreamFlush { xact_id } => {
+                            if let Err(e) = table.flush_transaction_stream(xact_id).await {
+                                println!("Stream flush failed: {}", e);
                             }
                         }
                         TableEvent::_Shutdown => {
