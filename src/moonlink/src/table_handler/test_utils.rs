@@ -111,6 +111,10 @@ impl TestEnvironment {
         self.send_event(TableEvent::Flush { lsn }).await;
     }
 
+    pub async fn stream_flush(&self, xact_id: u32) {
+        self.send_event(TableEvent::StreamFlush { xact_id }).await;
+    }
+
     // --- LSN and Verification Helpers ---
 
     /// Sets both table commit and replication LSN to the same value.
