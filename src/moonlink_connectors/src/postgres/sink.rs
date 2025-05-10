@@ -205,21 +205,6 @@ impl BatchSink for Sink {
 
     async fn write_cdc_event(&mut self, event: CdcEvent) -> Result<PgLsn, Self::Error> {
         // Dynamic tag based on event type
-        let event_type_str = match &event {
-            CdcEvent::Begin(_) => "Begin",
-            CdcEvent::Commit(_) => "Commit",
-            CdcEvent::Insert((id, _, _)) => &format!("Insert_table_{}", id),
-            CdcEvent::Update((id, _, _, _)) => &format!("Update_table_{}", id),
-            CdcEvent::Delete((id, _, _)) => &format!("Delete_table_{}", id),
-            CdcEvent::Relation(_) => "Relation",
-            CdcEvent::Type(_) => "Type",
-            CdcEvent::PrimaryKeepAlive(_) => "PrimaryKeepAlive",
-            CdcEvent::StreamStart(_) => "StreamStart",
-            CdcEvent::StreamStop(_) => "StreamStop",
-            CdcEvent::StreamCommit(_) => "StreamCommit",
-            CdcEvent::StreamAbort(_) => "StreamAbort",
-        };
-        let _guard = ProfileGuard::new(&format!("SINK_write_cdc_event_type_{}", event_type_str));
 
         match event {
             CdcEvent::Begin(begin_body) => {

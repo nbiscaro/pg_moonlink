@@ -254,8 +254,6 @@ impl Stream for TableCopyStream {
                 // If this conversion is complex and poll_next is slow, it might be a candidate for
                 // more granular profiling or optimization of the converter itself.
                 // For now, the overall poll_next time will capture it.
-                let _conversion_guard =
-                    ProfileGuard::new("SRC_POSTGRES_TableCopyStream_poll_next_conversion");
                 match TableRowConverter::try_from(&row_bytes, this.column_schemas) {
                     Ok(table_row) => Poll::Ready(Some(Ok(table_row))), // Renamed
                     Err(e) => {
@@ -330,8 +328,6 @@ impl Stream for CdcStream {
             Some(Ok(msg)) => {
                 // CdcEventConverter::try_from is already profiled internally.
                 // The time spent here will be captured by _guard.
-                let _conversion_guard =
-                    ProfileGuard::new("SRC_POSTGRES_CdcStream_poll_next_conversion");
                 match CdcEventConverter::try_from(msg, this.table_schemas) {
                     Ok(cdc_event) => Poll::Ready(Some(Ok(cdc_event))), // Renamed
                     Err(e) => Poll::Ready(Some(Err(e.into()))),
