@@ -201,10 +201,6 @@ impl<Src: Source, Snk: BatchSink> BatchDataPipeline<Src, Snk> {
         while let Some(event_result) = cdc_events_stream.next().await {
             // Renamed from 'event' to 'event_result'
             event_idx_counter += 1;
-            let _event_process_guard = ProfileGuard::new(&format!(
-                "PIPELINE_cdc_process_event_num_{}",
-                event_idx_counter
-            ));
 
             let mut send_status_update = false;
             if let Err(CdcStreamError::CdcEventConversion(
@@ -223,10 +219,6 @@ impl<Src: Source, Snk: BatchSink> BatchDataPipeline<Src, Snk> {
             }
             let returned_lsn = {
                 // Renamed from 'last_lsn' to avoid conflict
-                let _sink_write_cdc_guard = ProfileGuard::new(&format!(
-                    "PIPELINE_cdc_sink_write_event_num_{}",
-                    event_idx_counter
-                ));
                 self.sink
                     .write_cdc_event(event_val)
                     .await

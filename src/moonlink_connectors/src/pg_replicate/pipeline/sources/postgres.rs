@@ -322,7 +322,6 @@ impl Stream for CdcStream {
     type Item = Result<CdcEvent, CdcStreamError>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let _guard = ProfileGuard::new("SRC_POSTGRES_CdcStream_poll_next");
         let this = self.project();
         match ready!(this.stream.poll_next(cx)) {
             Some(Ok(msg)) => {
