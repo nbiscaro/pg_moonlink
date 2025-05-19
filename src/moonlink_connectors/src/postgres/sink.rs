@@ -116,33 +116,24 @@ impl BatchSink for Sink {
         Ok(())
     }
 
-    async fn write_table_rows(
+    async fn write_table_row(
         &mut self,
-        rows: Vec<TableRow>,
+        row: TableRow,
         table_id: TableId,
     ) -> Result<(), Self::Error> {
         let event_sender = self.event_senders.get_mut(&table_id).unwrap();
-        for row in rows {
-            event_sender
-                .send(TableEvent::Append {
-                    row: PostgresTableRow(row).into(),
-                    xact_id: None,
-                })
-                .await
-                .unwrap();
-        }
+        event_sender
+            .send(TableEvent::Append {
+                row: PostgresTableRow(row).into(),
+                xact_id: None,
+            })
+            .await
+            .unwrap();
         event_sender
             .send(TableEvent::Commit { lsn: 0 })
             .await
             .unwrap();
         Ok(())
-    }
-
-    async fn write_cdc_events(&mut self, events: Vec<CdcEvent>) -> Result<PgLsn, Self::Error> {
-        for event in events {
-            self.write_cdc_event(event).await?;
-        }
-        Ok(PgLsn::from(0))
     }
 
     async fn write_cdc_event(&mut self, event: CdcEvent) -> Result<PgLsn, Self::Error> {
