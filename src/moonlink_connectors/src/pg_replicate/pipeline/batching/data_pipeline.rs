@@ -8,7 +8,6 @@ use tracing::{debug, info};
 use crate::pg_replicate::{
     conversions::cdc_event::{CdcEvent, CdcEventConversionError},
     pipeline::{
-        batching::stream::BatchTimeoutStream,
         sinks::BatchSink,
         sources::{postgres::CdcStreamError, CommonSourceError, Source},
         PipelineAction, PipelineError,
@@ -16,22 +15,18 @@ use crate::pg_replicate::{
     table::TableId,
 };
 
-use super::BatchConfig;
-
-pub struct BatchDataPipeline<Src: Source, Snk: BatchSink> {
+pub struct DataPipeline<Src: Source, Snk: BatchSink> {
     source: Src,
     sink: Snk,
     action: PipelineAction,
-    batch_config: BatchConfig,
 }
 
-impl<Src: Source, Snk: BatchSink> BatchDataPipeline<Src, Snk> {
-    pub fn new(source: Src, sink: Snk, action: PipelineAction, batch_config: BatchConfig) -> Self {
-        BatchDataPipeline {
+impl<Src: Source, Snk: BatchSink> DataPipeline<Src, Snk> {
+    pub fn new(source: Src, sink: Snk, action: PipelineAction) -> Self {
+        DataPipeline {
             source,
             sink,
             action,
-            batch_config,
         }
     }
 
@@ -77,20 +72,12 @@ impl<Src: Source, Snk: BatchSink> BatchDataPipeline<Src, Snk> {
                 .await
                 .map_err(PipelineError::Source)?;
 
-            let batch_timeout_stream =
-                BatchTimeoutStream::new(table_rows, self.batch_config.clone());
+            pin!(table_rows);
 
-            pin!(batch_timeout_stream);
-
-            while let Some(batch) = batch_timeout_stream.next().await {
-                info!("got {} table copy events in a batch", batch.len());
-                //TODO: Avoid a vec copy
-                let mut rows = Vec::with_capacity(batch.len());
-                for row in batch {
-                    rows.push(row.map_err(CommonSourceError::TableCopyStream)?);
-                }
+            while let Some(row) = table_rows.next().await {
+                let row = row.map_err(CommonSourceError::TableCopyStream)?;
                 self.sink
-                    .write_table_rows(rows, table_schema.table_id)
+                    .write_table_row(row, table_schema.table_id)
                     .await
                     .map_err(PipelineError::Sink)?;
             }
