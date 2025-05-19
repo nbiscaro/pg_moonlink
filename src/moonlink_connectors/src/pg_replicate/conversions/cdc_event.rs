@@ -205,4 +205,3 @@ pub enum CdcEvent {
     StreamCommit(StreamCommitBody),
     StreamAbort(StreamAbortBody),
 }
-

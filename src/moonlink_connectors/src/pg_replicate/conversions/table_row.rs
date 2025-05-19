@@ -14,7 +14,6 @@ pub struct TableRow {
     pub values: Vec<Cell>,
 }
 
-
 #[derive(Debug, Error)]
 pub enum TableRowConversionError {
     #[error("unsupported type {0}")]
