@@ -26,13 +26,12 @@ pub trait BatchSink {
         &mut self,
         table_schemas: HashMap<TableId, TableSchema>,
     ) -> Result<(), Self::Error>;
-    async fn write_table_rows(
+    async fn write_table_row(
         &mut self,
-        rows: Vec<TableRow>,
+        row: TableRow,
         table_id: TableId,
     ) -> Result<(), Self::Error>;
     async fn write_cdc_event(&mut self, event: CdcEvent) -> Result<PgLsn, Self::Error>;
-    async fn write_cdc_events(&mut self, events: Vec<CdcEvent>) -> Result<PgLsn, Self::Error>;
     async fn table_copied(&mut self, table_id: TableId) -> Result<(), Self::Error>;
     async fn truncate_table(&mut self, table_id: TableId) -> Result<(), Self::Error>;
 }
