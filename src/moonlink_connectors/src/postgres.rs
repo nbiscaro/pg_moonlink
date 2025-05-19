@@ -1,8 +1,7 @@
 mod sink;
 mod util;
 use crate::pg_replicate::pipeline::{
-    batching::data_pipeline::BatchDataPipeline,
-    batching::BatchConfig,
+    batching::data_pipeline::DataPipeline,
     sinks::InfallibleSinkError,
     sources::postgres::{PostgresSource, PostgresSourceError, TableNamesFrom},
     PipelineAction, PipelineError,
@@ -11,7 +10,6 @@ use moonlink::{IcebergSnapshotStateManager, ReadStateManager};
 
 use sink::*;
 use std::path::PathBuf;
-use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_postgres::{connect, Client, NoTls};
@@ -82,9 +80,7 @@ impl MoonlinkPostgresSource {
             iceberg_snapshot_notifier,
             PathBuf::from(self.table_base_path.clone()),
         );
-        let batch_config = BatchConfig::new(1000, Duration::from_secs(1));
-        let mut pipeline =
-            BatchDataPipeline::new(source, sink, PipelineAction::CdcOnly, batch_config);
+        let mut pipeline = DataPipeline::new(source, sink, PipelineAction::CdcOnly);
         let pipeline_handle = tokio::task::spawn_blocking(move || {
             tokio::runtime::Handle::current().block_on(async move { pipeline.start().await })
         });
