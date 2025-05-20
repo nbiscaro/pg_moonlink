@@ -1,3 +1,4 @@
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use std::{collections::HashSet, pin::Pin, time::Instant};
 
 use futures::{stream::Stream, StreamExt};
@@ -144,13 +145,32 @@ impl<Src: Source, Snk: BatchSink> BatchDataPipeline<Src, Snk> {
                 CdcEvent::PrimaryKeepAlive(primary_keepalive_body) => {
                     send_status_update = primary_keepalive_body.reply() == 1;
                 }
+                CdcEvent::Commit(commit_body) => {
+                    // print out the current timestamp
+                    let now = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap()
+                        .as_secs() as i64;
+                    println!("received commit event at: {:?}", now);
+                    println!("xid: {:?}", commit_body.commit_lsn());
+                }
+                CdcEvent::StreamCommit(stream_commit_body) => {
+                    // print out the current timestamp
+                    let now = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap()
+                        .as_secs() as i64;
+                    println!("received stream commit event at: {:?}", now);
+                    println!("xid: {:?}", stream_commit_body.xid());
+                }
                 _ => {}
             }
-            let last_lsn = self
-                .sink
-                .write_cdc_event(event)
-                .await
-                .map_err(PipelineError::Sink)?;
+            let last_lsn = PgLsn::from(0);
+            // let last_lsn = self
+            //     .sink
+            //     .write_cdc_event(event)
+            //     .await
+            //     .map_err(PipelineError::Sink)?;
             if send_status_update {
                 info!("sending status update with lsn: {last_lsn}");
                 cdc_events.as_mut().send_status_update(last_lsn).await;
