@@ -4,7 +4,7 @@ mod error;
 
 pub use error::Error;
 use error::Result;
-use moonlink_connectors::MoonlinkPostgresSource;
+use moonlink_connectors::ReplicationManager;
 use std::sync::Arc;
 use std::{collections::HashMap, hash::Hash};
 use tokio::sync::RwLock;
@@ -14,8 +14,7 @@ const DEFAULT_MOONLINK_TABLE_BASE_PATH: &str = "./mooncake/";
 
 pub struct MoonlinkBackend<T: Eq + Hash> {
     // Could be either relative or absolute path.
-    moonlink_table_base_path: String,
-    ingest_sources: RwLock<Vec<MoonlinkPostgresSource>>,
+    replication_manager: RwLock<ReplicationManager>,
     table_readers: RwLock<HashMap<T, ReadStateManager>>,
     iceberg_snapshot_managers: RwLock<HashMap<T, IcebergSnapshotStateManager>>,
 }
@@ -29,43 +28,16 @@ impl<T: Eq + Hash + Clone> Default for MoonlinkBackend<T> {
 impl<T: Eq + Hash + Clone> MoonlinkBackend<T> {
     pub fn new(base_path: String) -> Self {
         Self {
-            moonlink_table_base_path: base_path,
-            ingest_sources: RwLock::new(Vec::new()),
+            replication_manager: RwLock::new(ReplicationManager::new(base_path.clone())),
             table_readers: RwLock::new(HashMap::new()),
             iceberg_snapshot_managers: RwLock::new(HashMap::new()),
         }
     }
 
     pub async fn create_table(&self, table_id: T, table_name: &str, uri: &str) -> Result<()> {
-        let mut ingest_sources = self.ingest_sources.write().await;
-        for ingest_source in ingest_sources.iter_mut() {
-            if ingest_source.check_table_belongs_to_source(uri) {
-                let (reader_state_manager, iceberg_snapshot_manager) =
-                    ingest_source.add_table(table_name).await?;
-                self.table_readers
-                    .write()
-                    .await
-                    .insert(table_id.clone(), reader_state_manager);
-                self.iceberg_snapshot_managers
-                    .write()
-                    .await
-                    .insert(table_id, iceberg_snapshot_manager);
-                return Ok(());
-            }
-        }
-
-        let base_path = std::path::Path::new(&self.moonlink_table_base_path);
-        tokio::fs::create_dir_all(base_path).await?;
-        let canonicalized_base_path = tokio::fs::canonicalize(base_path).await?;
-
-        let mut ingest_source = MoonlinkPostgresSource::new(
-            uri.to_owned(),
-            canonicalized_base_path.to_str().unwrap().to_string(),
-        )
-        .await?;
+        let mut manager = self.replication_manager.write().await;
         let (reader_state_manager, iceberg_snapshot_manager) =
-            ingest_source.add_table(table_name).await?;
-        ingest_sources.push(ingest_source);
+            manager.add_table(uri, table_name).await?;
         self.table_readers
             .write()
             .await
