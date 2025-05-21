@@ -32,6 +32,8 @@ impl ReplicationManager {
         table_name: &str,
     ) -> Result<(ReadStateManager, IcebergSnapshotStateManager), PostgresSourceError> {
         if !self.sources.contains_key(uri) {
+            // Lazily create the directory that will hold all tables.
+            // This will not overwrite any existing directory.
             tokio::fs::create_dir_all(&self.table_base_path)
                 .await
                 .map_err(PostgresSourceError::Io)?;
