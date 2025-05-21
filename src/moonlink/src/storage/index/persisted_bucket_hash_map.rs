@@ -615,7 +615,7 @@ mod tests {
         let mut builder = GlobalIndexBuilder::new();
         builder
             .set_files(files)
-            .set_directory(tempfile::tempdir().unwrap().into_path());
+            .set_directory(tempfile::tempdir().unwrap().keep());
         let index = builder.build_from_flush(hash_entries.clone()).await;
 
         let data_file_ids = [FileId(data_file.clone())];
@@ -648,7 +648,7 @@ mod tests {
         let mut builder = GlobalIndexBuilder::new();
         builder
             .set_files(files)
-            .set_directory(tempfile::tempdir().unwrap().into_path());
+            .set_directory(tempfile::tempdir().unwrap().keep());
         let index1 = builder.build_from_flush(vec).await;
         let files = vec![
             Arc::new(PathBuf::from("4.parquet")),
@@ -658,10 +658,10 @@ mod tests {
         let mut builder = GlobalIndexBuilder::new();
         builder
             .set_files(files)
-            .set_directory(tempfile::tempdir().unwrap().into_path());
+            .set_directory(tempfile::tempdir().unwrap().keep());
         let index2 = builder.build_from_flush(vec).await;
         let mut builder = GlobalIndexBuilder::new();
-        builder.set_directory(tempfile::tempdir().unwrap().into_path());
+        builder.set_directory(tempfile::tempdir().unwrap().keep());
         let merged = builder._build_from_merge(vec![index1, index2]).await;
 
         for i in 0u64..100u64 {
