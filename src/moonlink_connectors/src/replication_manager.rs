@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use crate::{MoonlinkPostgresSource, PostgresSourceError};
+use crate::{PostgresSourceError, ReplicationConnection};
 use moonlink::{IcebergSnapshotStateManager, ReadStateManager};
 
 /// Manage replication sources keyed by their connection URI.
@@ -10,14 +10,14 @@ use moonlink::{IcebergSnapshotStateManager, ReadStateManager};
 /// replication. A new replication will automatically be started when a
 /// table is added for a URI that is not currently being replicated.
 pub struct ReplicationManager {
-    sources: HashMap<String, MoonlinkPostgresSource>,
+    connections: HashMap<String, ReplicationConnection>,
     table_base_path: String,
 }
 
 impl ReplicationManager {
     pub fn new(table_base_path: String) -> Self {
         Self {
-            sources: HashMap::new(),
+            connections: HashMap::new(),
             table_base_path,
         }
     }
@@ -31,7 +31,7 @@ impl ReplicationManager {
         uri: &str,
         table_name: &str,
     ) -> Result<(ReadStateManager, IcebergSnapshotStateManager), PostgresSourceError> {
-        if !self.sources.contains_key(uri) {
+        if !self.connections.contains_key(uri) {
             // Lazily create the directory that will hold all tables.
             // This will not overwrite any existing directory.
             tokio::fs::create_dir_all(&self.table_base_path)
@@ -40,14 +40,13 @@ impl ReplicationManager {
             let base_path = tokio::fs::canonicalize(&self.table_base_path)
                 .await
                 .map_err(PostgresSourceError::Io)?;
-            let source = MoonlinkPostgresSource::new(
-                uri.to_owned(),
-                base_path.to_str().unwrap().to_string(),
-            )
-            .await?;
-            self.sources.insert(uri.to_string(), source);
+            let replication_connection =
+                ReplicationConnection::new(uri.to_owned(), base_path.to_str().unwrap().to_string())
+                    .await?;
+            self.connections
+                .insert(uri.to_string(), replication_connection);
         }
-        let source = self.sources.get_mut(uri).unwrap();
-        source.add_table(table_name).await
+        let replication_connection = self.connections.get_mut(uri).unwrap();
+        replication_connection.add_table(table_name).await
     }
 }
