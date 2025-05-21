@@ -1,5 +1,5 @@
 use crate::pg_replicate::conversions::cdc_event::{CdcEvent, CdcEventConversionError};
-use crate::pg_replicate::postgres_sink::Sink;
+use crate::pg_replicate::moonlink_sink::Sink;
 use crate::pg_replicate::postgres_source::{
     CdcStreamError, PostgresSource, PostgresSourceError, TableNamesFrom,
 };
