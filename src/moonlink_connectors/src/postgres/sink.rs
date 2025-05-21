@@ -1,19 +1,16 @@
 use crate::pg_replicate::{
     conversions::{cdc_event::CdcEvent, table_row::TableRow},
-    pipeline::{
-        sinks::{BatchSink, InfallibleSinkError},
-        PipelineReplicationState, PipelineResumptionState,
-    },
+    replication_state::ReplicationState,
     table::{TableId, TableSchema},
 };
 use crate::postgres::util::postgres_schema_to_moonlink_schema;
 use crate::postgres::util::PostgresTableRow;
-use async_trait::async_trait;
 use moonlink::IcebergSnapshotStateManager;
 use moonlink::IcebergTableConfig;
 use moonlink::ReadStateManager;
 use moonlink::{MooncakeTable, TableConfig, TableEvent, TableHandler};
 use std::collections::{HashMap, HashSet};
+use std::convert::Infallible;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::mpsc::Sender;
@@ -35,7 +32,7 @@ pub struct Sink {
     reader_notifier: Sender<ReadStateManager>,
     iceberg_snapshot_notifier: Sender<IcebergSnapshotStateManager>,
     base_path: PathBuf,
-    replication_state: Arc<PipelineReplicationState>,
+    replication_state: Arc<ReplicationState>,
 }
 
 impl Sink {
@@ -56,26 +53,16 @@ impl Sink {
             reader_notifier,
             iceberg_snapshot_notifier,
             base_path,
-            replication_state: PipelineReplicationState::new(),
+            replication_state: ReplicationState::new(),
         }
     }
 }
 
-#[async_trait]
-impl BatchSink for Sink {
-    type Error = InfallibleSinkError;
-
-    async fn get_resumption_state(&mut self) -> Result<PipelineResumptionState, Self::Error> {
-        Ok(PipelineResumptionState {
-            copied_tables: HashSet::new(),
-            last_lsn: PgLsn::from(0),
-        })
-    }
-
-    async fn write_table_schemas(
+impl Sink {
+    pub async fn write_table_schemas(
         &mut self,
         table_schemas: HashMap<TableId, TableSchema>,
-    ) -> Result<(), Self::Error> {
+    ) -> Result<(), Infallible> {
         let table_handlers = &mut self.table_handlers;
         for (table_id, table_schema) in table_schemas {
             let table_path =
@@ -116,11 +103,13 @@ impl BatchSink for Sink {
         Ok(())
     }
 
+    // TODO: Use this when copying the intial table with data. Currently we assume the table to be empty and start streaming cdc events immediately for simplicity.
+    #[allow(dead_code)]
     async fn write_table_row(
         &mut self,
         row: TableRow,
         table_id: TableId,
-    ) -> Result<(), Self::Error> {
+    ) -> Result<(), Infallible> {
         let event_sender = self.event_senders.get_mut(&table_id).unwrap();
         event_sender
             .send(TableEvent::Append {
@@ -136,7 +125,7 @@ impl BatchSink for Sink {
         Ok(())
     }
 
-    async fn write_cdc_event(&mut self, event: CdcEvent) -> Result<PgLsn, Self::Error> {
+    pub async fn write_cdc_event(&mut self, event: CdcEvent) -> Result<PgLsn, Infallible> {
         match event {
             CdcEvent::Begin(begin_body) => {
                 self.transaction_state.final_lsn = begin_body.final_lsn();
@@ -282,13 +271,10 @@ impl BatchSink for Sink {
         Ok(PgLsn::from(0))
     }
 
-    async fn table_copied(&mut self, table_id: TableId) -> Result<(), Self::Error> {
+    // TODO: Use this when we add back table copy.
+    #[allow(dead_code)]
+    async fn table_copied(&mut self, table_id: TableId) -> Result<(), Infallible> {
         println!("table {table_id} copied");
-        Ok(())
-    }
-
-    async fn truncate_table(&mut self, table_id: TableId) -> Result<(), Self::Error> {
-        println!("table {table_id} truncated");
         Ok(())
     }
 }
