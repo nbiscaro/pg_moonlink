@@ -12,14 +12,14 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_postgres::{connect, Client, NoTls};
 
-pub struct MoonlinkPostgresSource {
+pub struct ReplicationConnection {
     uri: String,
     table_base_path: String,
     postgres_client: Client,
     handle: Option<JoinHandle<Result<(), PostgresSourceError>>>,
 }
 
-impl MoonlinkPostgresSource {
+impl ReplicationConnection {
     pub async fn new(uri: String, table_base_path: String) -> Result<Self, PostgresSourceError> {
         let (postgres_client, connection) = connect(&uri, NoTls).await.unwrap();
         tokio::spawn(async move {
@@ -41,10 +41,7 @@ impl MoonlinkPostgresSource {
         })
     }
 
-    pub async fn add_table(
-        &mut self,
-        table_name: &str,
-    ) -> Result<(ReadStateManager, IcebergSnapshotStateManager), PostgresSourceError> {
+    async fn add_table_to_publication(&self, table_name: &str) -> Result<(), PostgresSourceError> {
         self.postgres_client
             .simple_query(&format!(
                 "ALTER PUBLICATION moonlink_pub ADD TABLE {};",
@@ -59,15 +56,28 @@ impl MoonlinkPostgresSource {
             ))
             .await
             .unwrap();
-        let source = PostgresSource::new(
+        Ok(())
+    }
+
+    async fn create_postgres_source(&self) -> Result<PostgresSource, PostgresSourceError> {
+        PostgresSource::new(
             &self.uri,
             Some("moonlink_slot".to_string()),
             TableNamesFrom::Publication("moonlink_pub".to_string()),
         )
-        .await?;
-        // Use channel to blockingly asynchronously create and get ReadStateManager and IcebergSnapshotStateManager.
-        let (reader_notifier, mut reader_notifier_receiver) = mpsc::channel(1);
-        let (iceberg_snapshot_notifier, mut iceberg_snapshot_notifier_receiver) = mpsc::channel(1);
+        .await
+    }
+
+    async fn spawn_replication(
+        &mut self,
+        source: PostgresSource,
+    ) -> (
+        JoinHandle<Result<(), PostgresSourceError>>,
+        mpsc::Receiver<ReadStateManager>,
+        mpsc::Receiver<IcebergSnapshotStateManager>,
+    ) {
+        let (reader_notifier, reader_notifier_receiver) = mpsc::channel(1);
+        let (iceberg_snapshot_notifier, iceberg_snapshot_notifier_receiver) = mpsc::channel(1);
 
         let sink = Sink::new(
             reader_notifier,
@@ -75,10 +85,26 @@ impl MoonlinkPostgresSource {
             PathBuf::from(self.table_base_path.clone()),
         );
         let handle = tokio::spawn(async move { run_replication(source, sink).await });
+
+        (
+            handle,
+            reader_notifier_receiver,
+            iceberg_snapshot_notifier_receiver,
+        )
+    }
+
+    pub async fn add_table(
+        &mut self,
+        table_name: &str,
+    ) -> Result<(ReadStateManager, IcebergSnapshotStateManager), PostgresSourceError> {
+        self.add_table_to_publication(table_name).await?;
+
+        let source = self.create_postgres_source().await?;
+        let (handle, mut reader_rx, mut iceberg_rx) = self.spawn_replication(source).await;
         self.handle = Some(handle);
 
-        let read_state_manager = reader_notifier_receiver.recv().await;
-        let iceberg_snapshot_manager = iceberg_snapshot_notifier_receiver.recv().await;
+        let read_state_manager = reader_rx.recv().await;
+        let iceberg_snapshot_manager = iceberg_rx.recv().await;
         Ok((
             read_state_manager.unwrap(),
             iceberg_snapshot_manager.unwrap(),
