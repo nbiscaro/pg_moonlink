@@ -1,6 +1,5 @@
-mod sink;
-mod util;
 use crate::pg_replicate::conversions::cdc_event::{CdcEvent, CdcEventConversionError};
+use crate::pg_replicate::postgres_sink::Sink;
 use crate::pg_replicate::postgres_source::{
     CdcStreamError, PostgresSource, PostgresSourceError, TableNamesFrom,
 };
@@ -8,7 +7,6 @@ use moonlink::{IcebergSnapshotStateManager, ReadStateManager};
 use tokio::pin;
 
 use futures::StreamExt;
-use sink::*;
 use std::path::PathBuf;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
