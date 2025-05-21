@@ -42,6 +42,9 @@ pub enum PostgresSourceError {
 
     #[error("cdc stream error: {0}")]
     CdcStream(#[from] CdcStreamError),
+
+    #[error("io error: {0}")]
+    Io(#[from] std::io::Error),
 }
 
 pub struct PostgresSource {
