@@ -1,13 +1,13 @@
 mod sink;
 mod util;
-use crate::pg_replicate::pipeline::{
-    batching::data_pipeline::DataPipeline,
-    sinks::InfallibleSinkError,
-    sources::postgres::{PostgresSource, PostgresSourceError, TableNamesFrom},
-    PipelineAction, PipelineError,
+use crate::pg_replicate::conversions::cdc_event::{CdcEvent, CdcEventConversionError};
+use crate::pg_replicate::source::{
+    CdcStreamError, PostgresSource, PostgresSourceError, TableNamesFrom,
 };
 use moonlink::{IcebergSnapshotStateManager, ReadStateManager};
+use tokio::pin;
 
+use futures::StreamExt;
 use sink::*;
 use std::path::PathBuf;
 use tokio::sync::mpsc;
@@ -18,11 +18,7 @@ pub struct MoonlinkPostgresSource {
     uri: String,
     table_base_path: String,
     postgres_client: Client,
-    handle: Option<
-        JoinHandle<
-            std::result::Result<(), PipelineError<PostgresSourceError, InfallibleSinkError>>,
-        >,
-    >,
+    handle: Option<JoinHandle<Result<(), PostgresSourceError>>>,
 }
 
 impl MoonlinkPostgresSource {
@@ -80,11 +76,8 @@ impl MoonlinkPostgresSource {
             iceberg_snapshot_notifier,
             PathBuf::from(self.table_base_path.clone()),
         );
-        let mut pipeline = DataPipeline::new(source, sink, PipelineAction::CdcOnly);
-        let pipeline_handle = tokio::task::spawn_blocking(move || {
-            tokio::runtime::Handle::current().block_on(async move { pipeline.start().await })
-        });
-        self.handle = Some(pipeline_handle);
+        let handle = tokio::spawn(async move { run_replication(source, sink).await });
+        self.handle = Some(handle);
 
         let read_state_manager = reader_notifier_receiver.recv().await;
         let iceberg_snapshot_manager = iceberg_snapshot_notifier_receiver.recv().await;
@@ -97,4 +90,45 @@ impl MoonlinkPostgresSource {
     pub fn check_table_belongs_to_source(&self, uri: &str) -> bool {
         self.uri == uri
     }
+}
+
+async fn run_replication(
+    mut source: PostgresSource,
+    mut sink: Sink,
+) -> Result<(), PostgresSourceError> {
+    sink.write_table_schemas(source.get_table_schemas().clone())
+        .await
+        .unwrap();
+
+    //TODO: add separate stream for initial table copy.
+    // This assumes the table is empty and we can naively begin copying rows immediatley. If a table already contains data, this is not the case. We will need to use the get_table_copy_stream method to get the initial rows and write them into a new table. In parallel, we will need to buffer the cdc events for this table until the initial rows are written. For simplicity, we will assume that the table is empty at this point, and add a new stream for initial table copy later.
+
+    source.commit_transaction().await?;
+
+    // TODO: start from the last lsn in replication state for recovery.
+    // TODO: track tables copied in replication state.
+    let mut last_lsn: u64 = 0;
+    last_lsn += 1;
+    let stream = source.get_cdc_stream(last_lsn.into()).await?;
+
+    pin!(stream);
+
+    while let Some(event) = stream.next().await {
+        let mut send_status_update = false;
+        if let Err(CdcStreamError::CdcEventConversion(CdcEventConversionError::MissingSchema(_))) =
+            &event
+        {
+            continue;
+        }
+        if let Ok(CdcEvent::PrimaryKeepAlive(body)) = &event {
+            send_status_update = body.reply() == 1;
+        }
+        let event = event?;
+        let last_lsn = sink.write_cdc_event(event).await.unwrap();
+        if send_status_update {
+            let _ = stream.as_mut().send_status_update(last_lsn).await;
+        }
+    }
+
+    Ok(())
 }
