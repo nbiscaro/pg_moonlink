@@ -1,7 +1,7 @@
 mod sink;
 mod util;
 use crate::pg_replicate::conversions::cdc_event::{CdcEvent, CdcEventConversionError};
-use crate::pg_replicate::source::{
+use crate::pg_replicate::postgres_source::{
     CdcStreamError, PostgresSource, PostgresSourceError, TableNamesFrom,
 };
 use moonlink::{IcebergSnapshotStateManager, ReadStateManager};
