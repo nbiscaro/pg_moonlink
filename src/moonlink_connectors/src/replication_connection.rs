@@ -90,9 +90,7 @@ impl ReplicationConnection {
         source: PostgresSource,
         sink: Sink,
     ) -> JoinHandle<Result<(), PostgresSourceError>> {
-        let handle = tokio::spawn(async move { run_replication(source, sink).await });
-
-        handle
+        tokio::spawn(async move { run_replication(source, sink).await })
     }
 
     pub async fn build_and_register_table_components(
@@ -102,19 +100,16 @@ impl ReplicationConnection {
         replication_state: &ReplicationState,
     ) {
         for (table_id, schema) in source.get_table_schemas() {
-            let resources = build_table_components(
-                &schema,
-                Path::new(&self.table_base_path),
-                replication_state,
-            )
-            .await;
+            let resources =
+                build_table_components(schema, Path::new(&self.table_base_path), replication_state)
+                    .await;
 
             self.table_readers
-                .insert(table_id.clone(), resources.read_state_manager);
+                .insert(*table_id, resources.read_state_manager);
             self.iceberg_snapshot_managers
-                .insert(table_id.clone(), resources.iceberg_snapshot_manager);
+                .insert(*table_id, resources.iceberg_snapshot_manager);
 
-            sink.register_table(table_id.clone(), resources.sink_components);
+            sink.register_table(*table_id, resources.sink_components);
         }
     }
 
