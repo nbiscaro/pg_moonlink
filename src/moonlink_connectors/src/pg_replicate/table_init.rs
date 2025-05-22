@@ -1,7 +1,10 @@
-use crate::pg_replicate::util::postgres_schema_to_moonlink_schema;
 use crate::pg_replicate::replication_state::ReplicationState;
 use crate::pg_replicate::table::TableSchema;
-use moonlink::{IcebergSnapshotStateManager, IcebergTableConfig, MooncakeTable, TableConfig, TableEvent, TableHandler, ReadStateManager};
+use crate::pg_replicate::util::postgres_schema_to_moonlink_schema;
+use moonlink::{
+    IcebergSnapshotStateManager, IcebergTableConfig, MooncakeTable, ReadStateManager, TableConfig,
+    TableEvent, TableHandler,
+};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::{mpsc::Sender, watch};
@@ -25,7 +28,7 @@ pub struct TableResources {
 pub async fn build_table_components(
     table_schema: &TableSchema,
     base_path: &Path,
-    replication_state: Arc<ReplicationState>,
+    replication_state: &ReplicationState,
 ) -> TableResources {
     let table_path = PathBuf::from(base_path).join(table_schema.table_name.to_string());
     tokio::fs::create_dir_all(&table_path).await.unwrap();
@@ -49,7 +52,8 @@ pub async fn build_table_components(
     .await;
 
     let (commit_tx, commit_rx) = watch::channel(0u64);
-    let read_state_manager = ReadStateManager::new(&table, replication_state.subscribe(), commit_rx);
+    let read_state_manager =
+        ReadStateManager::new(&table, replication_state.subscribe(), commit_rx);
     let mut iceberg_snapshot_manager = IcebergSnapshotStateManager::new();
     let handler = TableHandler::new(table, &mut iceberg_snapshot_manager);
     let event_sender = handler.get_event_sender();
@@ -66,4 +70,3 @@ pub async fn build_table_components(
         iceberg_snapshot_manager,
     }
 }
-
