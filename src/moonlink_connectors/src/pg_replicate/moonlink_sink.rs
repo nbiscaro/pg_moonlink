@@ -1,21 +1,18 @@
-use crate::pg_replicate::util::postgres_schema_to_moonlink_schema;
 use crate::pg_replicate::util::PostgresTableRow;
 use crate::pg_replicate::{
     conversions::{cdc_event::CdcEvent, table_row::TableRow},
     replication_state::ReplicationState,
-    table::{TableId, TableSchema},
+    table::TableId,
 };
-use moonlink::IcebergSnapshotStateManager;
-use moonlink::IcebergTableConfig;
-use moonlink::ReadStateManager;
-use moonlink::{MooncakeTable, TableConfig, TableEvent, TableHandler};
+use moonlink::{TableEvent, TableHandler};
 use std::collections::{HashMap, HashSet};
 use std::convert::Infallible;
-use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::mpsc::Sender;
 use tokio::sync::watch;
 use tokio_postgres::types::PgLsn;
+
+use super::table_init::TableComponents;
 
 #[derive(Default)]
 struct TransactionState {
@@ -29,18 +26,11 @@ pub struct Sink {
     event_senders: HashMap<TableId, Sender<TableEvent>>,
     streaming_transactions_state: HashMap<u32, TransactionState>,
     transaction_state: TransactionState,
-    reader_notifier: Sender<ReadStateManager>,
-    iceberg_snapshot_notifier: Sender<IcebergSnapshotStateManager>,
-    base_path: PathBuf,
     replication_state: Arc<ReplicationState>,
 }
 
 impl Sink {
-    pub fn new(
-        reader_notifier: Sender<ReadStateManager>,
-        iceberg_snapshot_notifier: Sender<IcebergSnapshotStateManager>,
-        base_path: PathBuf,
-    ) -> Self {
+    pub fn new(replication_state: Arc<ReplicationState>) -> Self {
         Self {
             table_handlers: HashMap::new(),
             last_committed_lsn_per_table: HashMap::new(),
@@ -50,59 +40,17 @@ impl Sink {
                 final_lsn: 0,
                 touched_tables: HashSet::new(),
             },
-            reader_notifier,
-            iceberg_snapshot_notifier,
-            base_path,
-            replication_state: ReplicationState::new(),
+            replication_state,
         }
     }
 }
 
 impl Sink {
-    pub async fn write_table_schemas(
-        &mut self,
-        table_schemas: HashMap<TableId, TableSchema>,
-    ) -> Result<(), Infallible> {
-        let table_handlers = &mut self.table_handlers;
-        for (table_id, table_schema) in table_schemas {
-            let table_path =
-                PathBuf::from(&self.base_path).join(table_schema.table_name.to_string());
-            tokio::fs::create_dir_all(&table_path).await.unwrap();
-            let (arrow_schema, identity) = postgres_schema_to_moonlink_schema(&table_schema);
-            let iceberg_table_config = IcebergTableConfig {
-                warehouse_uri: self.base_path.to_str().unwrap().to_string(),
-                namespace: vec!["default".to_string()],
-                table_name: table_schema.table_name.to_string(),
-                // TODO(hjiang): Disable recovery in production, at the moment we only support create new table from scratch.
-                drop_table_if_exists: true,
-            };
-            let table = MooncakeTable::new(
-                arrow_schema,
-                table_schema.table_name.to_string(),
-                table_id as u64,
-                table_path,
-                identity,
-                iceberg_table_config,
-                TableConfig::new(),
-            )
-            .await;
-            let (table_commit_tx, table_commit_rx) = watch::channel(0u64);
-            self.last_committed_lsn_per_table
-                .insert(table_id, table_commit_tx);
-            let read_state_manager =
-                ReadStateManager::new(&table, self.replication_state.subscribe(), table_commit_rx);
-            let mut iceberg_snapshot_state_manager = IcebergSnapshotStateManager::new();
-            let table_handler = TableHandler::new(table, &mut iceberg_snapshot_state_manager);
-            self.event_senders
-                .insert(table_id, table_handler.get_event_sender());
-            self.reader_notifier.send(read_state_manager).await.unwrap();
-            self.iceberg_snapshot_notifier
-                .send(iceberg_snapshot_state_manager)
-                .await
-                .unwrap();
-            table_handlers.insert(table_id, table_handler);
-        }
-        Ok(())
+    pub fn register_table(&mut self, table_id: TableId, components: TableComponents) {
+        self.last_committed_lsn_per_table
+            .insert(table_id, components.commit_lsn_sender);
+        self.event_senders.insert(table_id, components.event_sender);
+        self.table_handlers.insert(table_id, components.handler);
     }
 
     // TODO: Use this when copying the intial table with data. Currently we assume the table to be empty and start streaming cdc events immediately for simplicity.
