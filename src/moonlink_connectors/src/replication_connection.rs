@@ -3,20 +3,24 @@ use crate::pg_replicate::moonlink_sink::Sink;
 use crate::pg_replicate::postgres_source::{
     CdcStreamError, PostgresSource, PostgresSourceError, TableNamesFrom,
 };
+use crate::pg_replicate::table_init::build_table_components;
 use moonlink::{IcebergSnapshotStateManager, ReadStateManager};
 use tokio::pin;
 
+use crate::pg_replicate::replication_state::ReplicationState;
+use crate::pg_replicate::table::TableId;
 use futures::StreamExt;
-use std::path::PathBuf;
-use tokio::sync::mpsc;
+use std::collections::HashMap;
+use std::path::Path;
 use tokio::task::JoinHandle;
 use tokio_postgres::{connect, Client, NoTls};
-
 pub struct ReplicationConnection {
     uri: String,
     table_base_path: String,
     postgres_client: Client,
     handle: Option<JoinHandle<Result<(), PostgresSourceError>>>,
+    table_readers: HashMap<TableId, ReadStateManager>,
+    iceberg_snapshot_managers: HashMap<TableId, IcebergSnapshotStateManager>,
 }
 
 impl ReplicationConnection {
@@ -38,6 +42,8 @@ impl ReplicationConnection {
             table_base_path,
             postgres_client,
             handle: None,
+            table_readers: HashMap::new(),
+            iceberg_snapshot_managers: HashMap::new(),
         })
     }
 
@@ -68,47 +74,72 @@ impl ReplicationConnection {
         .await
     }
 
+    pub fn get_table_reader(&self, table_id: TableId) -> &ReadStateManager {
+        self.table_readers.get(&table_id).unwrap()
+    }
+
+    pub fn get_iceberg_snapshot_manager(
+        &mut self,
+        table_id: TableId,
+    ) -> &mut IcebergSnapshotStateManager {
+        self.iceberg_snapshot_managers.get_mut(&table_id).unwrap()
+    }
+
     async fn spawn_replication(
         &mut self,
         source: PostgresSource,
-    ) -> (
-        JoinHandle<Result<(), PostgresSourceError>>,
-        mpsc::Receiver<ReadStateManager>,
-        mpsc::Receiver<IcebergSnapshotStateManager>,
-    ) {
-        let (reader_notifier, reader_notifier_receiver) = mpsc::channel(1);
-        let (iceberg_snapshot_notifier, iceberg_snapshot_notifier_receiver) = mpsc::channel(1);
-
-        let sink = Sink::new(
-            reader_notifier,
-            iceberg_snapshot_notifier,
-            PathBuf::from(self.table_base_path.clone()),
-        );
+        sink: Sink,
+    ) -> JoinHandle<Result<(), PostgresSourceError>> {
         let handle = tokio::spawn(async move { run_replication(source, sink).await });
 
-        (
-            handle,
-            reader_notifier_receiver,
-            iceberg_snapshot_notifier_receiver,
-        )
+        handle
     }
 
-    pub async fn add_table(
+    pub async fn build_and_register_table_components(
         &mut self,
-        table_name: &str,
-    ) -> Result<(ReadStateManager, IcebergSnapshotStateManager), PostgresSourceError> {
+        source: &PostgresSource,
+        sink: &mut Sink,
+        replication_state: &ReplicationState,
+    ) {
+        for (table_id, schema) in source.get_table_schemas() {
+            let resources = build_table_components(
+                &schema,
+                Path::new(&self.table_base_path),
+                replication_state,
+            )
+            .await;
+
+            self.table_readers
+                .insert(table_id.clone(), resources.read_state_manager);
+            self.iceberg_snapshot_managers
+                .insert(table_id.clone(), resources.iceberg_snapshot_manager);
+
+            sink.register_table(table_id.clone(), resources.sink_components);
+        }
+    }
+
+    pub async fn add_table(&mut self, table_name: &str) -> Result<TableId, PostgresSourceError> {
         self.add_table_to_publication(table_name).await?;
 
+        // TODO: We still build the replication connection as part of the add table functionality. The reason being we don't yet have a way to add a table to an already running replication connection. This is to be done in a follow up PR to support multiple tables.
+        let replication_state = ReplicationState::new();
         let source = self.create_postgres_source().await?;
-        let (handle, mut reader_rx, mut iceberg_rx) = self.spawn_replication(source).await;
+        let mut sink = Sink::new(replication_state.clone());
+        let table_schemas = source.get_table_schemas().clone();
+        self.build_and_register_table_components(&source, &mut sink, &replication_state)
+            .await;
+
+        let handle = self.spawn_replication(source, sink).await;
         self.handle = Some(handle);
 
-        let read_state_manager = reader_rx.recv().await;
-        let iceberg_snapshot_manager = iceberg_rx.recv().await;
-        Ok((
-            read_state_manager.unwrap(),
-            iceberg_snapshot_manager.unwrap(),
-        ))
+        // TODO: This is temporary since we are still adding all the tables at the same time and then starting the replication. In the future, we will be able to add a new table to an already running replication connection in which case we want to return just id of this new table. This is what we are simulating here.
+        let table_id = table_schemas
+            .iter()
+            .find(|(_, s)| s.table_name.to_string() == table_name)
+            .map(|(id, _)| *id)
+            .expect("table schema not found");
+
+        Ok(table_id)
     }
 
     pub fn check_table_belongs_to_source(&self, uri: &str) -> bool {
@@ -120,10 +151,6 @@ async fn run_replication(
     mut source: PostgresSource,
     mut sink: Sink,
 ) -> Result<(), PostgresSourceError> {
-    sink.write_table_schemas(source.get_table_schemas().clone())
-        .await
-        .unwrap();
-
     //TODO: add separate stream for initial table copy.
     // This assumes the table is empty and we can naively begin copying rows immediatley. If a table already contains data, this is not the case. We will need to use the get_table_copy_stream method to get the initial rows and write them into a new table. In parallel, we will need to buffer the cdc events for this table until the initial rows are written. For simplicity, we will assume that the table is empty at this point, and add a new stream for initial table copy later.
 
