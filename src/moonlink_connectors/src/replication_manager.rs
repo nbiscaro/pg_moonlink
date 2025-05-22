@@ -1,7 +1,8 @@
-use std::collections::HashMap;
-
+use crate::pg_replicate::table::TableId;
 use crate::{PostgresSourceError, ReplicationConnection};
 use moonlink::{IcebergSnapshotStateManager, ReadStateManager};
+use std::collections::HashMap;
+use std::hash::Hash;
 
 /// Manage replication sources keyed by their connection URI.
 ///
@@ -9,16 +10,18 @@ use moonlink::{IcebergSnapshotStateManager, ReadStateManager};
 /// provides a single entry point to add new tables to a running
 /// replication. A new replication will automatically be started when a
 /// table is added for a URI that is not currently being replicated.
-pub struct ReplicationManager {
+pub struct ReplicationManager<T: Eq + Hash> {
     connections: HashMap<String, ReplicationConnection>,
     table_base_path: String,
+    table_info: HashMap<T, (String, TableId)>,
 }
 
-impl ReplicationManager {
+impl<T: Eq + Hash> ReplicationManager<T> {
     pub fn new(table_base_path: String) -> Self {
         Self {
             connections: HashMap::new(),
             table_base_path,
+            table_info: HashMap::new(),
         }
     }
 
@@ -29,8 +32,9 @@ impl ReplicationManager {
     pub async fn add_table(
         &mut self,
         uri: &str,
+        external_table_id: T,
         table_name: &str,
-    ) -> Result<(ReadStateManager, IcebergSnapshotStateManager), PostgresSourceError> {
+    ) -> Result<(), PostgresSourceError> {
         if !self.connections.contains_key(uri) {
             // Lazily create the directory that will hold all tables.
             // This will not overwrite any existing directory.
@@ -47,6 +51,26 @@ impl ReplicationManager {
                 .insert(uri.to_string(), replication_connection);
         }
         let replication_connection = self.connections.get_mut(uri).unwrap();
-        replication_connection.add_table(table_name).await
+
+        let table_id = replication_connection.add_table(table_name).await?;
+        self.table_info
+            .insert(external_table_id, (uri.to_string(), table_id));
+
+        Ok(())
+    }
+
+    pub fn get_table_reader(&self, table_id: &T) -> &ReadStateManager {
+        let (uri, table_id) = self.table_info.get(table_id).expect("table not found");
+        let connection = self.connections.get(uri).expect("connection not found");
+        connection.get_table_reader(*table_id)
+    }
+
+    pub fn get_iceberg_snapshot_manager(
+        &mut self,
+        table_id: &T,
+    ) -> &mut IcebergSnapshotStateManager {
+        let (uri, table_id) = self.table_info.get(table_id).expect("table not found");
+        let connection = self.connections.get_mut(uri).expect("connection not found");
+        connection.get_iceberg_snapshot_manager(*table_id)
     }
 }
