@@ -15,7 +15,6 @@ use tokio::sync::{mpsc::Sender, watch};
 pub struct TableComponents {
     pub handler: TableHandler,
     pub event_sender: Sender<TableEvent>,
-    pub commit_lsn_sender: watch::Sender<u64>,
 }
 
 /// Resources that should be returned to the caller when a table is initialised.
@@ -52,9 +51,7 @@ pub async fn build_table_components(
     )
     .await;
 
-    let (commit_tx, commit_rx) = watch::channel(0u64);
-    let read_state_manager =
-        ReadStateManager::new(&table, replication_state.subscribe(), commit_rx);
+    let read_state_manager = ReadStateManager::new(&table, replication_state.subscribe());
 
     let (snapshot_completion_tx, snapshot_completion_rx) = mpsc::channel(1);
     let handler = TableHandler::new(table, snapshot_completion_tx);
@@ -65,7 +62,6 @@ pub async fn build_table_components(
     let sink_components = TableComponents {
         handler,
         event_sender,
-        commit_lsn_sender: commit_tx,
     };
 
     TableResources {
