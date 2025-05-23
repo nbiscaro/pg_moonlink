@@ -22,7 +22,6 @@ struct TransactionState {
 
 pub struct Sink {
     table_handlers: HashMap<TableId, TableHandler>,
-    last_committed_lsn_per_table: HashMap<TableId, watch::Sender<u64>>,
     event_senders: HashMap<TableId, Sender<TableEvent>>,
     streaming_transactions_state: HashMap<u32, TransactionState>,
     transaction_state: TransactionState,
@@ -33,7 +32,6 @@ impl Sink {
     pub fn new(replication_state: Arc<ReplicationState>) -> Self {
         Self {
             table_handlers: HashMap::new(),
-            last_committed_lsn_per_table: HashMap::new(),
             event_senders: HashMap::new(),
             streaming_transactions_state: HashMap::new(),
             transaction_state: TransactionState {
@@ -47,8 +45,6 @@ impl Sink {
 
 impl Sink {
     pub fn register_table(&mut self, table_id: TableId, components: TableComponents) {
-        self.last_committed_lsn_per_table
-            .insert(table_id, components.commit_lsn_sender);
         self.event_senders.insert(table_id, components.event_sender);
         self.table_handlers.insert(table_id, components.handler);
     }
@@ -90,11 +86,6 @@ impl Sink {
                         })
                         .await
                         .unwrap();
-                    self.last_committed_lsn_per_table
-                        .get_mut(table_id)
-                        .unwrap()
-                        .send(commit_body.commit_lsn())
-                        .unwrap();
                 }
                 self.transaction_state.touched_tables.clear();
             }
@@ -109,11 +100,6 @@ impl Sink {
                                 xact_id,
                             })
                             .await
-                            .unwrap();
-                        self.last_committed_lsn_per_table
-                            .get_mut(table_id)
-                            .unwrap()
-                            .send(stream_commit_body.commit_lsn())
                             .unwrap();
                     }
                 }
