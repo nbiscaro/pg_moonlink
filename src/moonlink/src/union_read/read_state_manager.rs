@@ -87,17 +87,17 @@ impl ReadStateManager {
         replication_lsn: u64,
         commit_lsn: u64,
     ) -> bool {
+        // Even if the requested LSN is larger than the latest snapshot LSN for this table, we can still serve the snapshot if it hasn't been touched.
+        let is_snapshot_clean = snapshot_lsn == commit_lsn;
         match requested_lsn {
-            // If no specific LSN is requested, we can always try to read the latest.
-            None => true,
+            // If no specific LSN is requested AND the snapshot is clean, we can serve the latest snapshot.
+            None => is_snapshot_clean,
             Some(req_lsn_val) => {
                 // Request can be satisfied if:
                 // 1. The requested LSN is already covered by the table snapshot.
                 // OR
-                // 2. The requested LSN is covered by replication, AND the snapshot
-                //    reflects all committed changes up to the snapshot LSN.
-                req_lsn_val <= snapshot_lsn
-                    || (req_lsn_val <= replication_lsn && snapshot_lsn == commit_lsn)
+                // 2. The requested LSN is covered by replication, AND the snapshot is clean
+                req_lsn_val <= snapshot_lsn || (req_lsn_val <= replication_lsn && is_snapshot_clean)
             }
         }
     }
@@ -110,17 +110,17 @@ impl ReadStateManager {
     ) -> Result<Arc<ReadState>> {
         let table_state_snapshot = self.table_snapshot.read().await;
         let mut last_read_state_guard = self.last_read_state.write().await;
+        let is_snapshot_clean = current_snapshot_lsn == current_commit_lsn;
 
         if self.last_read_lsn.load(Ordering::Acquire) < current_snapshot_lsn {
             // If the snapshot is fully committed and replication has progressed further,
             // we can consider the state valid up to the replication LSN.
-            let effective_lsn = if current_snapshot_lsn == current_commit_lsn
-                && current_snapshot_lsn < current_replication_lsn
-            {
-                current_replication_lsn
-            } else {
-                current_snapshot_lsn
-            };
+            let effective_lsn =
+                if is_snapshot_clean && current_snapshot_lsn < current_replication_lsn {
+                    current_replication_lsn
+                } else {
+                    current_snapshot_lsn
+                };
 
             let read_output = table_state_snapshot.request_read().await?;
 
