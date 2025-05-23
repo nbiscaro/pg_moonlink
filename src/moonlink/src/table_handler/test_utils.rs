@@ -56,7 +56,6 @@ pub struct TestEnvironment {
     event_sender: mpsc::Sender<TableEvent>,
     read_state_manager: Arc<ReadStateManager>,
     replication_tx: watch::Sender<u64>,
-    table_commit_tx: watch::Sender<u64>,
     iceberg_snapshot_manager: IcebergSnapshotStateManager,
     pub(crate) temp_dir: TempDir,
 }
@@ -89,13 +88,8 @@ impl TestEnvironment {
         .await;
 
         let (replication_tx, replication_rx) = watch::channel(0u64);
-        let (table_commit_tx, table_commit_rx) = watch::channel(0u64);
 
-        let read_state_manager = Arc::new(ReadStateManager::new(
-            &mooncake_table,
-            replication_rx,
-            table_commit_rx,
-        ));
+        let read_state_manager = Arc::new(ReadStateManager::new(&mooncake_table, replication_rx));
 
         let (snapshot_completion_tx, snapshot_completion_rx) = mpsc::channel(1);
         let handler = TableHandler::new(mooncake_table, snapshot_completion_tx);
@@ -108,7 +102,6 @@ impl TestEnvironment {
             event_sender,
             read_state_manager,
             replication_tx,
-            table_commit_tx,
             iceberg_snapshot_manager,
             temp_dir,
         }
@@ -195,9 +188,7 @@ impl TestEnvironment {
     /// Sets both table commit and replication LSN to the same value.
     /// This makes data up to `lsn` potentially readable.
     pub fn set_readable_lsn(&self, lsn: u64) {
-        self.table_commit_tx
-            .send(lsn)
-            .expect("Failed to send table commit LSN");
+        self.set_table_commit_lsn(lsn);
         self.replication_tx
             .send(lsn)
             .expect("Failed to send replication LSN");
@@ -205,9 +196,7 @@ impl TestEnvironment {
 
     /// Sets table commit LSN and a potentially higher replication LSN.
     pub fn set_readable_lsn_with_cap(&self, table_commit_lsn: u64, replication_cap_lsn: u64) {
-        self.table_commit_tx
-            .send(table_commit_lsn)
-            .expect("Failed to send table commit LSN");
+        self.set_table_commit_lsn(table_commit_lsn);
         self.replication_tx
             .send(replication_cap_lsn.max(table_commit_lsn))
             .expect("Failed to send replication LSN");
@@ -215,9 +204,7 @@ impl TestEnvironment {
 
     /// Directly set the table commit LSN watch channel.
     pub fn set_table_commit_lsn(&self, lsn: u64) {
-        self.table_commit_tx
-            .send(lsn)
-            .expect("Failed to send table commit LSN");
+        self.read_state_manager.set_last_commit_lsn(lsn);
     }
 
     /// Directly set the replication LSN watch channel.
