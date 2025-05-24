@@ -498,24 +498,17 @@ impl MooncakeTable {
         let metadata_clone = metadata.clone();
         let path_clone = metadata.path.clone();
 
-        let disk_slice_writer_join_handle = tokio::task::spawn_blocking(move || {
-            let mut disk_slice = DiskSliceWriter::new(
-                metadata_clone.schema.clone(),
-                path_clone,
-                batches,
-                Some(lsn),
-                next_file_id,
-                index,
-            );
-            block_on(disk_slice.write())?;
-            Ok(disk_slice)
-        });
+        let mut disk_slice = DiskSliceWriter::new(
+            metadata_clone.schema.clone(),
+            path_clone,
+            batches,
+            Some(lsn),
+            next_file_id,
+            index,
+        );
 
-        match disk_slice_writer_join_handle.await {
-            Ok(Ok(disk_slice)) => Ok(disk_slice),
-            Ok(Err(e)) => Err(e),
-            Err(join_error) => Err(Error::TokioJoinError(join_error.to_string())),
-        }
+        disk_slice.write().await?;
+        Ok(disk_slice)
     }
 
     async fn stream_flush(
