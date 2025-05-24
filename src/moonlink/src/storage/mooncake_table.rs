@@ -477,23 +477,35 @@ impl MooncakeTable {
         Arc::clone(&self.last_commit_lsn)
     }
 
-    /// Flush the given MemSlice and in-memory record batches into data files.
-    async fn inner_flush_data_files(
+    /// Flush `mem_slice` into parquet files and return the resulting `DiskSliceWriter`.
+    ///
+    /// When `snapshot_task` is provided, new batches and indices are recorded so
+    /// that they can be included in the next snapshot.  The `lsn` parameter
+    /// specifies the commit LSN for the flushed data.  When `lsn` is `None` the
+    /// caller is responsible for setting the final LSN on the returned
+    /// `DiskSliceWriter`.
+    ///
+    /// `sync_write` controls whether the write should be executed synchronously
+    /// using `block_on`.  Streaming flushes currently rely on synchronous writes
+    /// whereas normal flushes run asynchronously.
+    async fn flush_mem_slice(
         mem_slice: &mut MemSlice,
-        snapshot_task: &mut SnapshotTask,
         metadata: &Arc<TableMetadata>,
-        lsn: u64,
         next_file_id: u32,
+        lsn: Option<u64>,
+        snapshot_task: Option<&mut SnapshotTask>,
+        sync_write: bool,
     ) -> Result<DiskSliceWriter> {
         // Finalize the current batch (if needed)
         let (new_batch, batches, index) = mem_slice.drain().unwrap();
 
-        if let Some(batch) = new_batch {
-            snapshot_task.new_record_batches.push(batch);
-        }
-
         let index = Arc::new(index);
-        snapshot_task.new_mem_indices.push(index.clone());
+        if let Some(task) = snapshot_task {
+            if let Some(batch) = new_batch {
+                task.new_record_batches.push(batch);
+            }
+            task.new_mem_indices.push(index.clone());
+        }
 
         let metadata_clone = metadata.clone();
         let path_clone = metadata.path.clone();
@@ -502,34 +514,18 @@ impl MooncakeTable {
             metadata_clone.schema.clone(),
             path_clone,
             batches,
-            Some(lsn),
+            lsn,
             next_file_id,
             index,
         );
 
-        disk_slice.write().await?;
-        Ok(disk_slice)
-    }
+        if sync_write {
+            // TODO(nbiscaro): Find longer term solution that allows async write
+            block_on(disk_slice.write())?;
+        } else {
+            disk_slice.write().await?;
+        }
 
-    async fn stream_flush(
-        mem_slice: &mut MemSlice,
-        metadata: &Arc<TableMetadata>,
-        next_file_id: u32,
-    ) -> Result<DiskSliceWriter> {
-        // Finalize the current batch (if needed)
-        let (_, batches, index) = mem_slice.drain().unwrap();
-
-        let index = Arc::new(index);
-        let mut disk_slice = DiskSliceWriter::new(
-            metadata.schema.clone(),
-            metadata.path.clone(),
-            batches,
-            None,
-            next_file_id,
-            index,
-        );
-        // TODO(nbiscaro): Find longer term solution that allows aysnc write
-        block_on(disk_slice.write())?;
         Ok(disk_slice)
     }
 
@@ -538,8 +534,15 @@ impl MooncakeTable {
             let next_file_id = self.next_file_id;
             self.next_file_id += 1;
             let disk_slice =
-                Self::stream_flush(&mut stream_state.mem_slice, &self.metadata, next_file_id)
-                    .await?;
+                Self::flush_mem_slice(
+                    &mut stream_state.mem_slice,
+                    &self.metadata,
+                    next_file_id,
+                    None,
+                    None,
+                    true,
+                )
+                .await?;
 
             stream_state.new_disk_slices.push(disk_slice);
 
@@ -569,8 +572,15 @@ impl MooncakeTable {
             let next_file_id = self.next_file_id;
             self.next_file_id += 1;
             // Flush any remaining rows in the xact mem slice
-            let disk_slice =
-                Self::stream_flush(xact_mem_slice, &self.metadata, next_file_id).await?;
+            let disk_slice = Self::flush_mem_slice(
+                xact_mem_slice,
+                &self.metadata,
+                next_file_id,
+                None,
+                None,
+                true,
+            )
+            .await?;
             stream_state.new_disk_slices.push(disk_slice);
 
             // Update the LSN of all disk slices from pre-commit flushes
@@ -603,12 +613,13 @@ impl MooncakeTable {
         let next_file_id = self.next_file_id;
         self.next_file_id += 1;
         // Flush data files into iceberb table.
-        let disk_slice = Self::inner_flush_data_files(
+        let disk_slice = Self::flush_mem_slice(
             &mut self.mem_slice,
-            &mut self.next_snapshot_task,
             &self.metadata,
-            lsn,
             next_file_id,
+            Some(lsn),
+            Some(&mut self.next_snapshot_task),
+            false,
         )
         .await?;
         self.next_snapshot_task.new_disk_slices.push(disk_slice);
