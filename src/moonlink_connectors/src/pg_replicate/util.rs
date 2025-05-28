@@ -342,7 +342,18 @@ impl From<PostgresTableRow> for MoonlinkRow {
                 Cell::Numeric(value) => {
                     match value {
                         PgNumeric::Value(bigdecimal) => {
-                            values.push(RowValue::Decimal(bigdecimal.to_i128().unwrap()));
+                            let (int_val, scale) = bigdecimal.as_bigint_and_exponent();
+                            let multiplier = 10_i128.pow(scale as u32);
+                            if let Some(scaled_integer) =
+                                int_val.to_i128().and_then(|v| v.checked_mul(multiplier))
+                            {
+                                values.push(RowValue::Decimal(scaled_integer));
+                            } else {
+                                values.push(RowValue::Null); // handle overflow safely
+                                eprintln!(
+                                    "Decimal value too large to fit in i128 — storing as NULL"
+                                );
+                            }
                         }
                         _ => {
                             // DevNote:
