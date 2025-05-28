@@ -15,6 +15,7 @@ use moonlink::TableEvent;
 use std::collections::HashMap;
 use std::path::Path;
 use tokio::sync::mpsc::Sender;
+use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio_postgres::{connect, Client, NoTls};
 
@@ -26,6 +27,7 @@ pub struct ReplicationConnection {
     table_readers: HashMap<TableId, ReadStateManager>,
     iceberg_snapshot_managers: HashMap<TableId, IcebergTableEventManager>,
     event_senders: Arc<RwLock<HashMap<TableId, Sender<TableEvent>>>>,
+    commit_lsn_txs: Arc<RwLock<HashMap<TableId, watch::Sender<u64>>>>,
     replication_state: Arc<ReplicationState>,
     source: PostgresSource,
 }
@@ -61,6 +63,7 @@ impl ReplicationConnection {
             table_readers: HashMap::new(),
             iceberg_snapshot_managers: HashMap::new(),
             event_senders: Arc::new(RwLock::new(HashMap::new())),
+            commit_lsn_txs: Arc::new(RwLock::new(HashMap::new())),
             replication_state: ReplicationState::new(),
             source: postgres_source,
         })
@@ -142,6 +145,10 @@ impl ReplicationConnection {
             .write()
             .unwrap()
             .insert(table_id, resources.event_sender);
+        self.commit_lsn_txs
+            .write()
+            .unwrap()
+            .insert(table_id, resources.commit_lsn_tx);
 
         Ok(())
     }
@@ -152,7 +159,11 @@ impl ReplicationConnection {
             self.add_table_to_replication(schema).await?;
         }
 
-        let sink = Sink::new(self.replication_state.clone(), self.event_senders.clone());
+        let sink = Sink::new(
+            self.replication_state.clone(),
+            self.event_senders.clone(),
+            self.commit_lsn_txs.clone(),
+        );
         self.handle = Some(self.spawn_replication_task(sink).await);
 
         Ok(())
