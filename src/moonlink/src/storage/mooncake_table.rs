@@ -21,8 +21,6 @@ pub(crate) use crate::storage::mooncake_table::table_snapshot::{
 use std::collections::HashMap;
 use std::mem::take;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::AtomicU64;
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use arrow::record_batch::RecordBatch;
@@ -295,9 +293,6 @@ pub struct MooncakeTable {
     /// Iceberg table manager, used to sync snapshot to the corresponding iceberg table.
     iceberg_table_manager: Option<Box<dyn TableManager>>,
 
-    /// LSN of the latest commit.
-    last_commit_lsn: Arc<AtomicU64>,
-
     /// LSN of the latest iceberg snapshot.
     last_iceberg_snapshot_lsn: Option<u64>,
 }
@@ -351,7 +346,6 @@ impl MooncakeTable {
             table_snapshot_watch_receiver,
             next_file_id: 0,
             iceberg_table_manager: Some(table_manager),
-            last_commit_lsn: Arc::new(AtomicU64::new(0)),
             last_iceberg_snapshot_lsn: None,
         })
     }
@@ -429,7 +423,6 @@ impl MooncakeTable {
     pub fn commit(&mut self, lsn: u64) {
         self.next_snapshot_task.new_commit_lsn = lsn;
         self.next_snapshot_task.new_commit_point = Some(self.mem_slice.get_commit_check_point());
-        self.last_commit_lsn.store(lsn, Ordering::Release);
     }
 
     pub fn should_flush(&self) -> bool {
@@ -521,11 +514,6 @@ impl MooncakeTable {
     pub fn abort_in_stream_batch(&mut self, xact_id: u32) {
         // Record abortion in snapshot task so we can remove any uncomitted deletions
         self.transaction_stream_states.remove(&xact_id);
-    }
-
-    /// Get the last commit LSN handle.
-    pub fn commit_lsn_handle(&self) -> Arc<AtomicU64> {
-        Arc::clone(&self.last_commit_lsn)
     }
 
     /// Flush `mem_slice` into parquet files and return the resulting `DiskSliceWriter`.
@@ -626,8 +614,6 @@ impl MooncakeTable {
             snapshot_task
                 .new_disk_slices
                 .append(&mut stream_state.new_disk_slices);
-
-            self.last_commit_lsn.store(lsn, Ordering::Release);
 
             Ok(())
         } else {
