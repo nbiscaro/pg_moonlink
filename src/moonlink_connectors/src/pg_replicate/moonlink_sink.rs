@@ -24,6 +24,7 @@ struct TransactionState {
 pub struct Sink {
     table_handlers: HashMap<TableId, TableHandler>,
     event_senders: Arc<RwLock<HashMap<TableId, Sender<TableEvent>>>>,
+    commit_lsn_txs: Arc<RwLock<HashMap<TableId, watch::Sender<u64>>>>,
     streaming_transactions_state: HashMap<u32, TransactionState>,
     transaction_state: TransactionState,
     replication_state: Arc<ReplicationState>,
@@ -33,10 +34,12 @@ impl Sink {
     pub fn new(
         replication_state: Arc<ReplicationState>,
         event_senders: Arc<RwLock<HashMap<TableId, Sender<TableEvent>>>>,
+        commit_lsn_txs: Arc<RwLock<HashMap<TableId, watch::Sender<u64>>>>,
     ) -> Self {
         Self {
             table_handlers: HashMap::new(),
             event_senders,
+            commit_lsn_txs,
             streaming_transactions_state: HashMap::new(),
             transaction_state: TransactionState {
                 final_lsn: 0,
@@ -87,6 +90,12 @@ impl Sink {
                         let event_senders_guard = self.event_senders.read().unwrap();
                         event_senders_guard.get(table_id).cloned()
                     };
+                    if let Some(commit_lsn_tx) = {
+                        let map = self.commit_lsn_txs.read().unwrap();
+                        map.get(table_id).cloned()
+                    } {
+                        let _ = commit_lsn_tx.send(commit_body.end_lsn());
+                    }
                     if let Some(event_sender) = event_sender {
                         event_sender
                             .send(TableEvent::Commit {
@@ -106,6 +115,12 @@ impl Sink {
                             let event_senders_guard = self.event_senders.read().unwrap();
                             event_senders_guard.get(table_id).cloned()
                         };
+                        if let Some(commit_lsn_tx) = {
+                            let map = self.commit_lsn_txs.read().unwrap();
+                            map.get(table_id).cloned()
+                        } {
+                            let _ = commit_lsn_tx.send(stream_commit_body.end_lsn());
+                        }
                         if let Some(event_sender) = event_sender {
                             event_sender
                                 .send(TableEvent::StreamCommit {
