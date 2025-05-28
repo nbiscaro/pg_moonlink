@@ -65,6 +65,7 @@ pub struct TestEnvironment {
     event_sender: mpsc::Sender<TableEvent>,
     read_state_manager: Arc<ReadStateManager>,
     replication_tx: watch::Sender<u64>,
+    last_commit_tx: watch::Sender<u64>,
     iceberg_snapshot_manager: IcebergTableEventManager,
     pub(crate) temp_dir: TempDir,
 }
@@ -98,8 +99,12 @@ impl TestEnvironment {
         .unwrap();
 
         let (replication_tx, replication_rx) = watch::channel(0u64);
-
-        let read_state_manager = Arc::new(ReadStateManager::new(&mooncake_table, replication_rx));
+        let (last_commit_tx, last_commit_rx) = watch::channel(0u64);
+        let read_state_manager = Arc::new(ReadStateManager::new(
+            &mooncake_table,
+            replication_rx,
+            last_commit_rx,
+        ));
 
         let (iceberg_snapshot_completion_tx, iceberg_snapshot_completion_rx) = mpsc::channel(1);
         let (iceberg_drop_table_completion_tx, iceberg_drop_table_completion_rx) = mpsc::channel(1);
@@ -121,6 +126,7 @@ impl TestEnvironment {
             event_sender,
             read_state_manager,
             replication_tx,
+            last_commit_tx,
             iceberg_snapshot_manager,
             temp_dir,
         }
@@ -230,7 +236,9 @@ impl TestEnvironment {
 
     /// Directly set the table commit LSN watch channel.
     pub fn set_table_commit_lsn(&self, lsn: u64) {
-        self.read_state_manager.set_last_commit_lsn(lsn);
+        self.last_commit_tx
+            .send(lsn)
+            .expect("Failed to send last commit LSN");
     }
 
     /// Directly set the replication LSN watch channel.
