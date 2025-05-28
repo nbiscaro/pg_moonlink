@@ -13,11 +13,15 @@ pub struct ReadStateManager {
     table_snapshot: Arc<RwLock<SnapshotTableState>>,
     table_snapshot_watch_receiver: watch::Receiver<u64>,
     replication_lsn_rx: watch::Receiver<u64>,
-    last_commit_lsn: Arc<AtomicU64>,
+    last_commit_lsn_rx: watch::Receiver<u64>,
 }
 
 impl ReadStateManager {
-    pub fn new(table: &MooncakeTable, replication_lsn_rx: watch::Receiver<u64>) -> Self {
+    pub fn new(
+        table: &MooncakeTable,
+        replication_lsn_rx: watch::Receiver<u64>,
+        last_commit_lsn_rx: watch::Receiver<u64>,
+    ) -> Self {
         let (table_snapshot, table_snapshot_watch_receiver) = table.get_state_for_reader();
         ReadStateManager {
             last_read_lsn: AtomicU64::new(0),
@@ -31,7 +35,7 @@ impl ReadStateManager {
             table_snapshot,
             table_snapshot_watch_receiver,
             replication_lsn_rx,
-            last_commit_lsn: table.commit_lsn_handle(),
+            last_commit_lsn_rx,
         }
     }
 
@@ -49,13 +53,13 @@ impl ReadStateManager {
 
         let mut table_snapshot_rx = self.table_snapshot_watch_receiver.clone();
         let mut replication_lsn_rx = self.replication_lsn_rx.clone();
-        let last_commit_lsn = self.last_commit_lsn.clone();
+        let last_commit_lsn = self.last_commit_lsn_rx.clone();
 
         loop {
             let current_snapshot_lsn = *table_snapshot_rx.borrow();
             let current_replication_lsn = *replication_lsn_rx.borrow();
 
-            let last_commit_lsn_val = last_commit_lsn.load(Ordering::Acquire);
+            let last_commit_lsn_val = *last_commit_lsn.borrow();
             if self.can_satisfy_read_from_snapshot(
                 requested_lsn,
                 current_snapshot_lsn,
@@ -155,11 +159,5 @@ impl ReadStateManager {
                 .map_err(|e| Error::WatchChannelRecvError { source: e })?;
         }
         Ok(())
-    }
-
-    #[cfg(test)]
-    // Helper function for tests to manually set the last commit LSN.
-    pub fn set_last_commit_lsn(&self, lsn: u64) {
-        self.last_commit_lsn.store(lsn, Ordering::Relaxed);
     }
 }
