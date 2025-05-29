@@ -119,7 +119,6 @@ impl TableHandler {
                                 Some(xact_id) => {
                                     let res = table.append_in_stream_batch(row, xact_id);
                                     if table.should_transaction_flush(xact_id) {
-                                        println!("Flushing transaction stream");
                                         if let Err(e) = table.flush_transaction_stream(xact_id).await {
                                             println!("Flush failed in Append: {}", e);
                                         }
