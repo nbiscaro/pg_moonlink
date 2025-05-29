@@ -329,7 +329,8 @@ mod tests {
 
     #[test]
     fn parse_text_array_quoted_null_as_string() {
-        let cell = TextFormatConverter::try_from_str(&Type::TEXT_ARRAY, "{\"a\",\"null\"}").unwrap();
+        let cell =
+            TextFormatConverter::try_from_str(&Type::TEXT_ARRAY, "{\"a\",\"null\"}").unwrap();
         match cell {
             Cell::Array(ArrayCell::String(v)) => {
                 assert_eq!(v, vec![Some("a".to_string()), Some("null".to_string())]);
