@@ -303,11 +303,7 @@ impl TextFormatConverter {
                     }
                 }
             }
-            let val = if val_str.to_lowercase() == "null" {
-                None
-            } else {
-                parse(&val_str)?
-            };
+            let val = parse(&val_str)?;
             res.push(val);
             val_str.clear();
         }
