@@ -12,7 +12,6 @@ use tokio::sync::mpsc::Sender;
 use tokio::sync::watch;
 use tokio_postgres::types::PgLsn;
 
-
 #[derive(Default)]
 struct TransactionState {
     final_lsn: u64,
