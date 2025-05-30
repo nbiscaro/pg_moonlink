@@ -21,6 +21,7 @@ struct TransactionState {
 pub struct Sink {
     event_senders: HashMap<TableId, Sender<TableEvent>>,
     commit_lsn_txs: HashMap<TableId, watch::Sender<u64>>,
+    snapshot_lsn_rxs: HashMap<TableId, watch::Receiver<u64>>,
     streaming_transactions_state: HashMap<u32, TransactionState>,
     transaction_state: TransactionState,
     replication_state: Arc<ReplicationState>,
@@ -31,6 +32,7 @@ impl Sink {
         Self {
             event_senders: HashMap::new(),
             commit_lsn_txs: HashMap::new(),
+            snapshot_lsn_rxs: HashMap::new(),
             streaming_transactions_state: HashMap::new(),
             transaction_state: TransactionState {
                 final_lsn: 0,
@@ -47,9 +49,11 @@ impl Sink {
         table_id: TableId,
         event_sender: Sender<TableEvent>,
         commit_lsn_tx: watch::Sender<u64>,
+        snapshot_lsn_rx: watch::Receiver<u64>,
     ) {
         self.event_senders.insert(table_id, event_sender);
         self.commit_lsn_txs.insert(table_id, commit_lsn_tx);
+        self.snapshot_lsn_rxs.insert(table_id, snapshot_lsn_rx);
     }
 
     pub async fn process_cdc_event(&mut self, event: CdcEvent) -> Result<PgLsn, Infallible> {
@@ -203,6 +207,12 @@ impl Sink {
                 self.streaming_transactions_state.remove(&xact_id);
             }
         }
-        Ok(PgLsn::from(0))
+        let last_lsn = self
+            .snapshot_lsn_rxs
+            .values()
+            .map(|rx| *rx.borrow())
+            .min()
+            .unwrap_or(0);
+        Ok(PgLsn::from(last_lsn))
     }
 }

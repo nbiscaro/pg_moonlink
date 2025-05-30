@@ -100,7 +100,8 @@ impl TestEnvironment {
             iceberg_drop_table_completion_rx,
             iceberg_snapshot_completion_rx,
         };
-        let handler = TableHandler::new(mooncake_table, iceberg_event_sync_sender);
+        let (snapshot_lsn_tx, snapshot_lsn_rx) = watch::channel(0u64);
+        let handler = TableHandler::new(mooncake_table, iceberg_event_sync_sender, snapshot_lsn_tx);
         let iceberg_snapshot_manager =
             IcebergTableEventManager::new(handler.get_event_sender(), iceberg_event_sync_receiver);
         let event_sender = handler.get_event_sender();

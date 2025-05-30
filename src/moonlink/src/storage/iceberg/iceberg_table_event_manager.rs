@@ -7,7 +7,7 @@ use crate::TableEvent;
 /// Contains a few receivers, which get notified after certain iceberg events completion.
 pub struct IcebergEventSyncReceiver {
     /// Gets notified when iceberg snapshot completes.
-    pub iceberg_snapshot_completion_rx: mpsc::Receiver<Result<()>>,
+    pub iceberg_snapshot_completion_rx: mpsc::Receiver<Result<u64>>,
 
     /// Get notified when iceberg drop table completes.
     pub iceberg_drop_table_completion_rx: mpsc::Receiver<Result<()>>,
@@ -18,7 +18,7 @@ pub struct IcebergTableEventManager {
     /// Used to initiate a mooncake and iceberg snapshot operation.
     table_event_tx: mpsc::Sender<TableEvent>,
     /// Used to synchronize on the completion of an iceberg snapshot.
-    snapshot_completion_rx: mpsc::Receiver<Result<()>>,
+    snapshot_completion_rx: mpsc::Receiver<Result<u64>>,
     /// Used to synchronize on the completion of an iceberg drop table.
     drop_table_completion_rx: mpsc::Receiver<Result<()>>,
 }
@@ -36,7 +36,7 @@ impl IcebergTableEventManager {
     }
 
     /// Synchronize on iceberg snapshot completion.
-    pub async fn sync_snapshot_completion(&mut self) -> Result<()> {
+    pub async fn sync_snapshot_completion(&mut self) -> Result<u64> {
         self.snapshot_completion_rx.recv().await.unwrap()
     }
 

@@ -4,6 +4,7 @@ use crate::storage::mooncake_table::IcebergSnapshotResult;
 use crate::storage::MooncakeTable;
 use crate::Result;
 use tokio::sync::mpsc::{self, Receiver, Sender};
+use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio::time::{self, Duration};
 
@@ -46,12 +47,15 @@ pub struct TableHandler {
 
     /// Sender for the event queue
     event_sender: Sender<TableEvent>,
+
+    /// Notify the latest iceberg flush LSN.
+    snapshot_lsn_tx: watch::Sender<u64>,
 }
 
 /// Contains a few senders, which notifies after certain iceberg events completion.
 pub struct IcebergEventSyncSender {
     /// Notifies when iceberg snapshot completes.
-    pub iceberg_snapshot_completion_tx: mpsc::Sender<Result<()>>,
+    pub iceberg_snapshot_completion_tx: mpsc::Sender<Result<u64>>,
 
     /// Notifies when iceberg drop table completes.
     pub iceberg_drop_table_completion_tx: mpsc::Sender<Result<()>>,
@@ -59,19 +63,24 @@ pub struct IcebergEventSyncSender {
 
 impl TableHandler {
     /// Create a new TableHandler for the given schema and table name
-    pub fn new(table: MooncakeTable, iceberg_event_sync_sender: IcebergEventSyncSender) -> Self {
+    pub fn new(
+        table: MooncakeTable,
+        iceberg_event_sync_sender: IcebergEventSyncSender,
+        snapshot_lsn_tx: watch::Sender<u64>,
+    ) -> Self {
         // Create channel for events
         let (event_sender, event_receiver) = mpsc::channel(100);
 
         // Spawn the task with the oneshot receiver
         let event_handle = Some(tokio::spawn(async move {
-            Self::event_loop(iceberg_event_sync_sender, event_receiver, table).await;
+            Self::event_loop(iceberg_event_sync_sender, event_receiver, table, snapshot_lsn_tx).await;
         }));
 
         // Create the handler
         Self {
             _event_handle: event_handle,
             event_sender,
+            snapshot_lsn_tx,
         }
     }
 
@@ -85,6 +94,7 @@ impl TableHandler {
         iceberg_event_sync_sender: IcebergEventSyncSender,
         mut event_receiver: Receiver<TableEvent>,
         mut table: MooncakeTable,
+        snapshot_lsn_tx: watch::Sender<u64>,
     ) {
         let mut periodic_snapshot_interval = time::interval(Duration::from_millis(500));
 
@@ -186,11 +196,17 @@ impl TableHandler {
 
                             // Fast-path: if iceberg snapshot requirement is already satisfied, notify directly.
                             let last_iceberg_snapshot_lsn = table.get_iceberg_snapshot_lsn();
-                            if last_iceberg_snapshot_lsn.is_some() && lsn <= last_iceberg_snapshot_lsn.unwrap() {
-                                iceberg_event_sync_sender.iceberg_snapshot_completion_tx.send(Ok(())).await.unwrap();
-                            }
-                            // Iceberg snapshot LSN requirement is not met, record the required LSN, so later commit will pick up.
-                            else {
+                            if let Some(last) = last_iceberg_snapshot_lsn {
+                                if lsn <= last {
+                                    iceberg_event_sync_sender
+                                        .iceberg_snapshot_completion_tx
+                                        .send(Ok(last))
+                                        .await
+                                        .unwrap();
+                                } else {
+                                    force_snapshot_lsn = Some(lsn);
+                                }
+                            } else {
                                 force_snapshot_lsn = Some(lsn);
                             }
                         }
@@ -255,8 +271,15 @@ impl TableHandler {
                         Ok(snapshot_res) => {
                             let iceberg_flush_lsn = snapshot_res.flush_lsn;
                             table.set_iceberg_snapshot_res(snapshot_res);
-                            if force_snapshot_lsn.is_some() && force_snapshot_lsn.unwrap() <= iceberg_flush_lsn {
-                                iceberg_event_sync_sender.iceberg_snapshot_completion_tx.send(Ok(())).await.unwrap();
+                            let _ = snapshot_lsn_tx.send(iceberg_flush_lsn);
+                            if force_snapshot_lsn.is_some()
+                                && force_snapshot_lsn.unwrap() <= iceberg_flush_lsn
+                            {
+                                iceberg_event_sync_sender
+                                    .iceberg_snapshot_completion_tx
+                                    .send(Ok(iceberg_flush_lsn))
+                                    .await
+                                    .unwrap();
                                 force_snapshot_lsn = None;
                             }
                         }

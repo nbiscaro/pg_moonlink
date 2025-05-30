@@ -23,11 +23,12 @@ pub struct TableResources {
     pub read_state_manager: ReadStateManager,
     pub iceberg_snapshot_manager: IcebergTableEventManager,
     pub commit_lsn_tx: watch::Sender<u64>,
+    pub snapshot_lsn_rx: watch::Receiver<u64>,
 }
 
 /// Create iceberg table event manager sender and receiver.
 fn create_iceberg_event_syncer() -> (IcebergEventSyncSender, IcebergEventSyncReceiver) {
-    let (iceberg_snapshot_completion_tx, iceberg_snapshot_completion_rx) = mpsc::channel(1);
+    let (iceberg_snapshot_completion_tx, iceberg_snapshot_completion_rx) = mpsc::channel::<Result<u64>>(1);
     let (iceberg_drop_table_completion_tx, iceberg_drop_table_completion_rx) = mpsc::channel(1);
     let iceberg_event_sync_sender = IcebergEventSyncSender {
         iceberg_drop_table_completion_tx,
@@ -68,10 +69,11 @@ pub async fn build_table_components(
     .await?;
 
     let (commit_lsn_tx, commit_lsn_rx) = watch::channel(0u64);
+    let (snapshot_lsn_tx, snapshot_lsn_rx) = watch::channel(0u64);
     let read_state_manager =
         ReadStateManager::new(&table, replication_state.subscribe(), commit_lsn_rx);
     let (iceberg_event_sync_sender, iceberg_event_sync_receiver) = create_iceberg_event_syncer();
-    let handler = TableHandler::new(table, iceberg_event_sync_sender);
+    let handler = TableHandler::new(table, iceberg_event_sync_sender, snapshot_lsn_tx);
     let iceberg_snapshot_manager =
         IcebergTableEventManager::new(handler.get_event_sender(), iceberg_event_sync_receiver);
     let event_sender = handler.get_event_sender();
@@ -81,5 +83,6 @@ pub async fn build_table_components(
         read_state_manager,
         iceberg_snapshot_manager,
         commit_lsn_tx,
+        snapshot_lsn_rx,
     })
 }

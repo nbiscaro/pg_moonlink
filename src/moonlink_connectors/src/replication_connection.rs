@@ -24,6 +24,7 @@ pub enum Command {
         schema: TableSchema,
         event_sender: mpsc::Sender<TableEvent>,
         commit_lsn_tx: watch::Sender<u64>,
+        snapshot_lsn_rx: watch::Receiver<u64>,
     },
 }
 
@@ -161,6 +162,7 @@ impl ReplicationConnection {
                 schema: schema.clone(),
                 event_sender: resources.event_sender,
                 commit_lsn_tx: resources.commit_lsn_tx,
+                snapshot_lsn_rx: resources.snapshot_lsn_rx,
             })
             .await
             .unwrap();
@@ -213,8 +215,8 @@ async fn run_event_loop(
     loop {
         tokio::select! {
             Some(cmd) = cmd_rx.recv() => match cmd {
-                Command::AddTable { table_id, schema, event_sender, commit_lsn_tx } => {
-                    sink.add_table(table_id, event_sender, commit_lsn_tx);
+                Command::AddTable { table_id, schema, event_sender, commit_lsn_tx, snapshot_lsn_rx } => {
+                    sink.add_table(table_id, event_sender, commit_lsn_tx, snapshot_lsn_rx);
                     stream.as_mut().add_table_schema(schema);
                 }
             },
