@@ -1,0 +1,95 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# cancel superseded runs for the same branch / PR
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-Dwarnings"
+
+defaults:
+  run:
+    shell: bash
+
+# ---------------------------------------------------------------------------
+# Jobs
+# ---------------------------------------------------------------------------
+jobs:
+  # ────────────────────────────── 1 · FORMAT + CLIPPY ─────────────────────────
+  lint:
+    name: Format & Clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # One toolchain install, cached across all jobs
+      - uses: dtolnay/rust-toolchain@stable
+        id: toolchain
+        with:
+          components: rustfmt,clippy
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          shared-key: ${{ steps.toolchain.outputs.cachekey }}
+
+      - name: rustfmt check
+        run: cargo fmt --check
+
+      - name: clippy lint
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+  # ───────────────────────── 2 · TEST & COVERAGE ────────────────────────────
+  coverage:
+    if: github.event_name == 'pull_request'
+    name: Unit Tests + Coverage (llvm-cov)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # to upload the artifact zip
+      pull-requests: write # to edit the PR comment
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        id: toolchain
+        with:
+          components: llvm-tools-preview
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          shared-key: ${{ steps.toolchain.outputs.cachekey }}
+
+      - uses: taiki-e/install-action@v2
+        with: { tool: cargo-llvm-cov }
+
+      # Run tests and emit the HTML report
+      - name: Build HTML dashboard
+        run: cargo llvm-cov --lib --html --locked --output-dir coverage-html
+
+      - name: Upload coverage HTML
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-html
+          path: "coverage-html/**"
+          retention-days: 14
+
+      # single-line comment body with the live artifact link
+      - name: Prepare comment
+        run: |
+          cat > coverage.md <<EOF
+          <!-- coverage-summary -->
+          [Download HTML coverage dashboard](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}#artifacts)
+          EOF
+
+      - name: Post / update PR comment
+        uses: thollander/actions-comment-pull-request@v3
+        with:
+          file-path: coverage.md
+          comment-tag: coverage-summary
