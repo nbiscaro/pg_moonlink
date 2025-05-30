@@ -148,15 +148,14 @@ impl ReadStateManager {
         table_snapshot_rx: &mut watch::Receiver<u64>,
     ) -> Result<()> {
         if requested_lsn_val > current_replication_lsn {
-            replication_lsn_rx
-                .changed()
-                .await
-                .map_err(|e| Error::WatchChannelRecvError { source: e })?;
-        } else {
-            table_snapshot_rx
-                .changed()
-                .await
-                .map_err(|e| Error::WatchChannelRecvError { source: e })?;
+            tokio::select! {
+                res = replication_lsn_rx.changed() => {
+                    res.map_err(|e| Error::WatchChannelRecvError { source: e })?;
+                }
+                res = table_snapshot_rx.changed() => {
+                    res.map_err(|e| Error::WatchChannelRecvError { source: e })?;
+                }
+            }
         }
         Ok(())
     }
