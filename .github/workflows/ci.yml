@@ -37,7 +37,7 @@ jobs:
 
       - uses: swatinem/rust-cache@v2
         with:
-          shared-key: ${{ steps.toolchain.outputs.cachekey }}
+          shared-key: ${{ cargo-cache }}
 
       - name: rustfmt check
         run: cargo fmt --check
@@ -60,7 +60,7 @@ jobs:
 
       - uses: swatinem/rust-cache@v2
         with:
-          shared-key: ${{ steps.toolchain.outputs.cachekey }}
+          shared-key: ${{ cargo-cache }}
 
       - uses: taiki-e/install-action@v2
         with: { tool: cargo-llvm-cov }
