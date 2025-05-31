@@ -50,9 +50,6 @@ jobs:
     if: github.event_name == 'pull_request'
     name: Unit Tests + Coverage (llvm-cov)
     runs-on: ubuntu-latest
-    permissions:
-      contents: write # to upload the artifact zip
-      pull-requests: write # to edit the PR comment
     steps:
       - uses: actions/checkout@v4
 
@@ -68,25 +65,16 @@ jobs:
       - uses: taiki-e/install-action@v2
         with: { tool: cargo-llvm-cov }
 
-      - name: Run tests and emit HTML report
-        run: cargo llvm-cov --lib --html --locked --output-dir coverage-html
-
-      - name: Upload coverage HTML
-        uses: actions/upload-artifact@v4
-        with:
-          name: coverage-html
-          path: "coverage-html/**"
-          retention-days: 14
-
-      - name: Prepare comment
+      - name: Run tests and generate lcov.info
         run: |
-          cat > coverage.md <<EOF
-          <!-- coverage-summary -->
-          [Download HTML coverage dashboard](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}#artifacts)
-          EOF
+          cargo llvm-cov --locked --lib \
+                         --lcov --output-path lcov.info
 
-      - name: Post / update PR comment
-        uses: thollander/actions-comment-pull-request@v3
+      - name: Upload to Codecov
+        uses: codecov/codecov-action@v5
+        env:
+          CODECOV_TOKEN: ${{ secrets.CODECOV_ORG_TOKEN }}
         with:
-          file-path: coverage.md
-          comment-tag: coverage-summary
+          files: lcov.info
+          verbose: true
+          fail_ci_if_error: true
