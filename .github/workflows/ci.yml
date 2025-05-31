@@ -47,7 +47,6 @@ jobs:
 
   # ───────────────────────── 2 · TEST & COVERAGE ────────────────────────────
   coverage:
-    if: github.event_name == 'pull_request'
     name: Unit Tests + Coverage (llvm-cov)
     runs-on: ubuntu-latest
     steps:
