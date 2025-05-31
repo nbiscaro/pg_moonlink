@@ -6,7 +6,7 @@ on:
   pull_request:
     branches: [main]
 
-# cancel superseded runs for the same branch / PR
+# Cancel superseded runs for the same branch / PR
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
@@ -30,7 +30,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # One toolchain install, cached across all jobs
       - uses: dtolnay/rust-toolchain@stable
         id: toolchain
         with:
@@ -69,8 +68,7 @@ jobs:
       - uses: taiki-e/install-action@v2
         with: { tool: cargo-llvm-cov }
 
-      # Run tests and emit the HTML report
-      - name: Build HTML dashboard
+      - name: Run tests and emit HTML report
         run: cargo llvm-cov --lib --html --locked --output-dir coverage-html
 
       - name: Upload coverage HTML
@@ -80,7 +78,6 @@ jobs:
           path: "coverage-html/**"
           retention-days: 14
 
-      # single-line comment body with the live artifact link
       - name: Prepare comment
         run: |
           cat > coverage.md <<EOF
