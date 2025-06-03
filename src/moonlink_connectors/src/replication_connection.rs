@@ -7,6 +7,8 @@ use crate::Result;
 use moonlink::{IcebergTableEventManager, ReadStateManager};
 use std::sync::Arc;
 use tokio::pin;
+use tokio::time::Duration;
+use tokio_postgres::types::PgLsn;
 
 use crate::pg_replicate::replication_state::ReplicationState;
 use crate::pg_replicate::table::{TableId, TableSchema};
@@ -268,8 +270,13 @@ async fn run_event_loop(
 ) -> Result<()> {
     pin!(stream);
 
+    let mut status_interval = tokio::time::interval(Duration::from_secs(10));
+
     loop {
         tokio::select! {
+             _ = status_interval.tick() => {
+                let _ = stream.as_mut().send_status_update(PgLsn::from(0)).await;
+            },
             Some(cmd) = cmd_rx.recv() => match cmd {
                 Command::AddTable { table_id, schema, event_sender, commit_lsn_tx } => {
                     sink.add_table(table_id, event_sender, commit_lsn_tx);
