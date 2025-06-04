@@ -13,9 +13,21 @@ impl TableName {
     pub fn parse_schema_name(table_name: &str) -> (String, String) {
         let tokens: Vec<&str> = table_name.split('.').collect();
         assert_eq!(tokens.len(), 2);
-        let schema = tokens[0].to_string();
-        let name = tokens[1].to_string();
+        let schema = Self::unquote_identifier(tokens[0]);
+        let name = Self::unquote_identifier(tokens[1]);
         (schema, name)
+    }
+
+    fn unquote_identifier(raw: &str) -> String {
+        if raw.starts_with('"') && raw.ends_with('"') && raw.len() >= 2 {
+            // strip outer quotes
+            let inner = &raw[1..raw.len() - 1];
+            // collapse double quotes
+            inner.replace("\"\"", "\"")
+        } else {
+            // unquoted identifiers are case-insensitive
+            raw.to_ascii_lowercase()
+        }
     }
     pub fn get_schema_name(&self) -> String {
         format!("{}.{}", self.schema, self.name)
