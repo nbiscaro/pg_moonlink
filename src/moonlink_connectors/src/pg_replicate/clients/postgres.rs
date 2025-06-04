@@ -638,3 +638,62 @@ impl ReplicationClient {
         Ok(stream)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn check(input: &str, exp_schema: &str, exp_name: &str) {
+        let (schema, name) = TableName::parse_schema_name(input);
+        assert_eq!(schema, exp_schema, "schema mismatch for `{input}`");
+        assert_eq!(name, exp_name, "name   mismatch for `{input}`");
+
+        // Round-trip sanity: build a TableName and
+        // make sure get_schema_name() is consistent.
+        let t = TableName { schema, name };
+        assert_eq!(t.get_schema_name(), format!("{exp_schema}.{exp_name}"));
+    }
+
+    #[test]
+    fn parses_edge_variants() {
+        // 1. plain lower-case, unquoted
+        check("public.r", "public", "r");
+
+        // 2. unquoted mixed-case (will fold to lower case)
+        check("public.CamelCase", "public", "camelcase");
+
+        // 3. quoted upper-case single letter
+        check(r#""public"."R""#, "public", "R");
+
+        // 4. identifier with space and dollar sign
+        check(r#""public"."Sales 2025$""#, "public", "Sales 2025$");
+
+        // 5. embedded double-quote  →  he said "hi"
+        check(r#""public"."he said ""hi""""#, "public", r#"he said "hi""#);
+
+        // 6. keyword used as identifier
+        check(r#""public"."select""#, "public", "select");
+
+        // 7. quoted schema + mixed-case table
+        check(r#""WeirdSchema"."MixedCase""#, "WeirdSchema", "MixedCase");
+
+        // 8. schema-qualified, unquoted mixed-case table
+        check("public.R2", "public", "r2");
+    }
+
+    #[test]
+    fn quoted_identifier_round_trip() {
+        // One representative case to ensure quote_identifier integration.
+        let (schema, name) = TableName::parse_schema_name(r#""public"."R""#);
+        let t = TableName { schema, name };
+
+        // pg_escape::quote_identifier should re-add quotes where needed
+        let expected = format!(
+            "{}.{}",
+            pg_escape::quote_identifier("public"),
+            pg_escape::quote_identifier("R")
+        );
+
+        assert_eq!(t.as_quoted_identifier(), expected);
+    }
+}
