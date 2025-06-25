@@ -1,14 +1,15 @@
+use crate::pg_replicate::clients::postgres::ReplicationClient;
 use crate::pg_replicate::conversions::cdc_event::CdcEventConversionError;
 use crate::pg_replicate::moonlink_sink::Sink;
-use crate::pg_replicate::postgres_source::CdcStream;
 use crate::pg_replicate::postgres_source::{
-    CdcStreamError, PostgresSource, PostgresSourceError, TableNamesFrom,
+    CdcStream, CdcStreamError, PostgresSource, PostgresSourceError, TableNamesFrom,
 };
 use crate::pg_replicate::table_init::build_table_components;
 use crate::Result;
 use moonlink::{IcebergTableEventManager, ObjectStorageCache, ReadStateManager};
 use std::sync::Arc;
 use tokio::pin;
+use tokio::select;
 use tokio::time::Duration;
 use tokio_postgres::error::SqlState;
 use tokio_postgres::types::PgLsn;
@@ -263,30 +264,32 @@ impl ReplicationConnection {
         sink: Sink,
         cmd_rx: mpsc::Receiver<Command>,
     ) -> JoinHandle<Result<()>> {
-        debug!("spawning replication task");
         if let Err(e) = self.source.commit_transaction().await {
-            error!(error = ?e, "failed to commit transaction");
-            return tokio::spawn(
-                async { Err(e.into()) }.instrument(info_span!("replication_task_error")),
-            );
+            return tokio::spawn(async { Err(e.into()) });
         }
 
-        // TODO: track tables copied in replication state and recover these before starting the event loop.
-        let last_lsn = self.source.confirmed_flush_lsn();
-        let stream = match self.source.get_cdc_stream(last_lsn).await {
-            Ok(s) => s,
-            Err(e) => {
-                error!(error = ?e, "failed to get cdc stream");
-                return tokio::spawn(
-                    async { Err(e.into()) }.instrument(info_span!("replication_task_error")),
-                );
-            }
-        };
+        let cfg = self.source.get_cdc_stream_config().unwrap();
+        let uri = self.uri.clone();
 
-        tokio::spawn(
-            async move { run_event_loop(stream, sink, cmd_rx).await }
-                .instrument(info_span!("replication_event_loop")),
-        )
+        tokio::spawn(async move {
+            let (client, connection) = ReplicationClient::connect_no_tls(&uri)
+                .await
+                .map_err(PostgresSourceError::from)?;
+
+            pin!(connection);
+
+            let stream = select! {
+                s = PostgresSource::create_cdc_stream(client, cfg) => s?,
+                _ = &mut connection => {
+                    return Err(PostgresSourceError::Io(std::io::Error::new(std::io::ErrorKind::ConnectionAborted, "connection closed during setup")).into());
+                }
+            };
+
+            select! {
+                r = run_event_loop(stream, sink, cmd_rx) => r,
+                _ = &mut connection => Err(PostgresSourceError::Io(std::io::Error::new(std::io::ErrorKind::ConnectionAborted, "replication connection closed")).into()),
+            }
+        })
     }
 
     async fn add_table_to_replication(&mut self, schema: &TableSchema) -> Result<()> {

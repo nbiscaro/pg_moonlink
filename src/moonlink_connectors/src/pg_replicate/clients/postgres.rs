@@ -59,29 +59,30 @@ pub enum ReplicationClientError {
 
 impl ReplicationClient {
     /// Connect to a postgres database in logical replication mode without TLS
-    pub async fn connect_no_tls(uri: &str) -> Result<ReplicationClient, ReplicationClientError> {
+    pub async fn connect_no_tls(
+        uri: &str,
+    ) -> Result<
+        (
+            ReplicationClient,
+            tokio_postgres::Connection<tokio_postgres::Socket, tokio_postgres::tls::NoTlsStream>,
+        ),
+        ReplicationClientError,
+    > {
         info!("connecting to postgres");
 
         let mut config = uri.parse::<Config>()?;
         config.replication_mode(ReplicationMode::Logical);
         let (postgres_client, connection) = config.connect(NoTls).await?;
 
-        tokio::spawn(
-            async move {
-                info!("waiting for connection to terminate");
-                if let Err(e) = connection.await {
-                    warn!("connection error: {}", e);
-                }
-            }
-            .instrument(info_span!("postgres_client_monitor")),
-        );
-
         info!("successfully connected to postgres");
 
-        Ok(ReplicationClient {
-            postgres_client,
-            in_txn: false,
-        })
+        Ok((
+            ReplicationClient {
+                postgres_client,
+                in_txn: false,
+            },
+            connection,
+        ))
     }
 
     /// Starts a read-only trasaction with repeatable read isolation level
